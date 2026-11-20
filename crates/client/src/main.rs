@@ -3,6 +3,7 @@ mod audio;
 mod benchmark;
 mod game;
 mod hud;
+mod map_transfer;
 mod options;
 mod scene;
 

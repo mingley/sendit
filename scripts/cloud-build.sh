@@ -5,14 +5,19 @@ cd "$(dirname "$0")/.."
 tools_dir=${SENDIT_TOOLS:-/workspace/.sendit-tools}
 export CARGO_HOME="$tools_dir/cargo" RUSTUP_HOME="$tools_dir/rustup"
 export PATH="$CARGO_HOME/bin:$PATH"
-mkdir -p "$tools_dir/bin"
+mkdir -p "$tools_dir"
 if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     curl -fsSL --retry 2 https://sh.rustup.rs -o "$tools_dir/rustup-init.sh"
     sh "$tools_dir/rustup-init.sh" -y --no-modify-path --profile minimal --default-toolchain none
 fi
 
-if ! pkg-config --exists alsa; then
-    # Extract only the build libraries into a private prefix. APT checks the
+packages=""
+if ! pkg-config --exists alsa; then packages="libasound2-dev libasound2t64"; fi
+if [ ! -d /dev/dri ] && [ ! -d /usr/share/vulkan/icd.d ]; then
+    packages="$packages mesa-vulkan-drivers"
+fi
+if [ -n "$packages" ]; then
+    # Install missing development libraries and the optional CPU Vulkan driver in a private prefix. APT checks the
     # signed Debian archive and package digests before dpkg-deb unpacks them.
     . /etc/os-release
     [ "$ID" = debian ] && [ "$(dpkg --print-architecture)" = amd64 ] || {
@@ -37,16 +42,18 @@ EOF
     (
         cd "$depot"
         apt-get update
-        apt-get download libasound2-dev libasound2t64
-        for name in libasound2-dev libasound2t64; do
+        apt-get download $packages
+        for name in $packages; do
             version=$(apt-cache policy "$name" | awk '/Candidate:/ {print $2}')
             package=$(find . -maxdepth 1 -name "${name}_${version}_amd64.deb" -print -quit)
             [ -n "$package" ]
             dpkg-deb -x "$package" "$sysroot"
         done
     )
-    export PKG_CONFIG_PATH="$sysroot/usr/lib/x86_64-linux-gnu/pkgconfig"
-    export PKG_CONFIG_SYSROOT_DIR="$sysroot"
+    if [ -f "$sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/alsa.pc" ]; then
+        export PKG_CONFIG_PATH="$sysroot/usr/lib/x86_64-linux-gnu/pkgconfig"
+        export PKG_CONFIG_SYSROOT_DIR="$sysroot"
+    fi
 fi
 rustup component add rustfmt
 cargo build --release --locked --workspace --jobs 4

@@ -271,6 +271,22 @@ impl World {
         self.players.values().map(|p| p.view).collect()
     }
 
+    /// Start an offline input drill at the captured pose and weapon state.
+    /// Independently received damage, resets, and objective state are outside an input trace.
+    pub fn add_replay_player(&mut self, state: PlayerView) -> bool {
+        if !self.add_team(state.id, state.team) {
+            return false;
+        }
+        let player = self.players.get_mut(&state.id).unwrap();
+        player.input = Input {
+            yaw: state.yaw,
+            pitch: state.pitch,
+            ..Input::default()
+        };
+        player.view = state;
+        true
+    }
+
     pub fn round_view(&self) -> RoundView {
         self.round
     }
@@ -306,19 +322,7 @@ impl World {
             }
             // Briefly carry analog intent over packet gaps. Edge actions require new input.
             let age = self.tick.wrapping_sub(player.received_at);
-            let mut input = player.input;
-            if age > 0 {
-                input.buy = false;
-                input.drop_bomb = false;
-                input.reload = false;
-            }
-            if age > 8 {
-                input = Input {
-                    yaw: input.yaw,
-                    pitch: input.pitch,
-                    ..Input::default()
-                };
-            }
+            let mut input = player.input.at_age(age);
             view.yaw = input.yaw;
             view.pitch = input.pitch;
             if self.mode == Mode::Competitive

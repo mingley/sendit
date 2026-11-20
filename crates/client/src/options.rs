@@ -1,7 +1,8 @@
 use bevy::prelude::Resource;
 use std::path::PathBuf;
 
-const HELP: &str = "sendit-client [--connect HOST:PORT] [--name NAME] [--password PASSWORD]
+const HELP: &str =
+    "sendit-client [--connect HOST:PORT] [--name NAME] [--password-env NAME | --password PASSWORD]
   --sensitivity NUMBER       Radians per raw mouse count (default 0.002)
   --width PX --height PX     Window dimensions (default 1920 x 1080)
   --record FILE              Record live fixed-tick inputs
@@ -54,6 +55,7 @@ impl Default for Options {
 impl Options {
     pub fn parse() -> Result<Option<Self>, String> {
         let mut opts = Self::default();
+        let mut supplied_password = false;
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
             if flag == "-h" || flag == "--help" {
@@ -75,7 +77,27 @@ impl Options {
             match flag.as_str() {
                 "--connect" => opts.address = value,
                 "--name" => opts.name = value,
-                "--password" => opts.password = value,
+                "--password" | "--password-env" => {
+                    if supplied_password {
+                        return Err("choose one password option".into());
+                    }
+                    supplied_password = true;
+                    opts.password = if flag == "--password" {
+                        value
+                    } else {
+                        if value.is_empty()
+                            || !value.bytes().enumerate().all(|(i, b)| {
+                                b == b'_'
+                                    || b.is_ascii_alphabetic()
+                                    || (i > 0 && b.is_ascii_digit())
+                            })
+                        {
+                            return Err("invalid password variable name".into());
+                        }
+                        std::env::var(&value)
+                            .map_err(|_| format!("password variable {value} is unavailable"))?
+                    };
+                }
                 "--sensitivity" => opts.sensitivity = value.parse().map_err(|_| invalid())?,
                 "--width" => opts.width = value.parse().map_err(|_| invalid())?,
                 "--height" => opts.height = value.parse().map_err(|_| invalid())?,

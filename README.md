@@ -52,3 +52,29 @@ Start one host per port. Competitive balances Terrorists and Counter-Terrorists 
 Each player has one life per live round. Use Tab for scores and to cycle living teammates while spectating. Both sides start with a 12-round rifle and $1,200. B buys the 30-round kit with 50 armor for $1,200 during buy time. The server awards money for outcomes, kills, and objective work. Survivors can carry their kit forward. Squads swap sides after 12 rounds. First to 13 wins, and 12–12 is a draw.
 
 Deathmatch continually respawns players. Select `--loadout light`, `standard`, or `armored` at startup. On a map without bomb sites, competitive uses elimination and the round clock, so the same geometry can host other rulesets.
+
+## Host a community server
+
+The Linux dedicated server embeds the stock arenas and has no display or audio dependency. Set the map, rules, capacity, optional password, and rotation on the command line. This example reads a password already set in the operator's environment.
+
+```sh
+target/release/sendit-server --name "Relay Club" --bind 0.0.0.0:27015 \
+  --mode competitive --max-players 10 --password-env SENDIT_PASSWORD \
+  --rotation relay,drill --rotate-seconds 900
+target/release/sendit-client --connect 127.0.0.1:27015 --password-env SENDIT_PASSWORD
+```
+
+Use the host's local console for `status`, `kick ID`, `map NAME`, `next`, `restart`, or `quit`. Closing stdin leaves the server running. Map changes keep connected clients in the session. Set `--rotate-seconds 0` for manual rotation.
+
+For LAN discovery, run `target/release/sendit-server discover`. The default broadcast targets UDP port 27015. For a different subnet or game port, pass `--target BROADCAST_IP:PORT`. Join the returned game address with `sendit-client --connect`.
+
+A community can also run an opt-in directory. Start the first command on the directory host. On the game host and on players' machines, replace `DIRECTORY_IP` with the directory's address.
+
+```sh
+target/release/sendit-server directory --bind 0.0.0.0:27016
+target/release/sendit-server --name "Relay Club" --mode competitive --public-list DIRECTORY_IP:27016
+target/release/sendit-server list --directory DIRECTORY_IP:27016
+target/release/sendit-probe verify-hosting --server target/release/sendit-server
+```
+
+Public listing requires the game host's UDP endpoint to be reachable by players. The directory verifies the announcing endpoint and expires silent entries after 60 seconds. Direct-IP joining continues when the directory is offline. The game protocol sends UDP packets, including the join password, in cleartext.

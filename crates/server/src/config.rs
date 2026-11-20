@@ -1,13 +1,22 @@
-use sendit_sim::{Loadout, Mode, Tuning};
+use sendit_sim::{map::valid_map_name, Loadout, Mode, Tuning};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub const HELP: &str = "\
 sendit-server [options]
+sendit-server discover [--target BROADCAST:GAME_PORT]
+sendit-server list --directory IP:PORT
+sendit-server directory [--bind IP:PORT]
+
+Hosting options
   --bind IP:PORT       Listen address (default 0.0.0.0:27015)
+  --name NAME          Name shown in LAN and opt-in directory listings
+  --public-list IP:PORT  Announce this game to the specified community directory
+  --rotation A,B,C     Ordered map identifiers; starts with the first unless --map is set
+  --rotate-seconds N   Seconds per map (default 900; 0 enables manual rotation only)
   --map NAME           Arena identifier (competitive default relay, otherwise drill)
   --mode MODE          practice, competitive, deathmatch, or surf (default practice)
-  --loadout KIT     Deathmatch spawn kit: standard, light, or armored
+  --loadout KIT        Deathmatch spawn kit: standard, light, or armored
   --max-players N      Maximum connected players (default 10)
   --password-env VAR   Read the join password from this environment variable
   --friction F         Override ground friction for tuning or replay
@@ -15,10 +24,16 @@ sendit-server [options]
   --ticks N            Exit after N fixed simulation ticks
   --report-ticks N     Print tick, CPU, RSS and network metrics every N ticks
                        (default 1280; 0 prints only the final summary)
-  --help               Show these options";
+  --help               Show these options
+
+Local console commands: status, kick ID, map NAME, next, restart, quit";
 
 pub struct Config {
     pub bind: SocketAddr,
+    pub name: String,
+    pub directory: Option<SocketAddr>,
+    pub rotation: Vec<String>,
+    pub rotate_seconds: u32,
     pub map: String,
     pub mode: Mode,
     pub dm_loadout: Loadout,
@@ -36,6 +51,10 @@ impl Config {
         let mut config = Config {
             bind: "0.0.0.0:27015".parse().unwrap(),
             map: "drill".into(),
+            name: "Sendit Community Server".into(),
+            directory: None,
+            rotation: Vec::new(),
+            rotate_seconds: 900,
             mode: Mode::Practice,
             dm_loadout: Loadout::Standard,
             capacity: 10,
@@ -52,6 +71,32 @@ impl Config {
                 .ok_or_else(|| format!("missing value for {flag}"))?;
             match flag.as_str() {
                 "--bind" => config.bind = value.parse().map_err(|_| "invalid listen address")?,
+                "--name" => {
+                    let name = value.trim();
+                    if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+                        return Err("server name must contain 1–64 printable bytes".into());
+                    }
+                    config.name = name.into();
+                }
+                "--public-list" => {
+                    config.directory = Some(value.parse().map_err(|_| "invalid directory IP:PORT")?)
+                }
+                "--rotation" => {
+                    config.rotation = value.split(',').map(|v| v.trim().to_owned()).collect();
+                    if config.rotation.len() > 32
+                        || config.rotation.iter().any(|name| !valid_map_name(name))
+                    {
+                        return Err("rotation requires 1–32 comma-separated map identifiers".into());
+                    }
+                    for (i, name) in config.rotation.iter().enumerate() {
+                        if config.rotation[..i].contains(name) {
+                            return Err(format!("duplicate map in rotation: {name}"));
+                        }
+                    }
+                }
+                "--rotate-seconds" => {
+                    config.rotate_seconds = value.parse().map_err(|_| "invalid map duration")?
+                }
                 "--map" => {
                     explicit_map = true;
                     config.map = value;
@@ -99,6 +144,11 @@ impl Config {
             }
             if !explicit_map {
                 config.map = "relay".into();
+            }
+        }
+        if !explicit_map {
+            if let Some(first) = config.rotation.first() {
+                config.map = first.clone();
             }
         }
         Ok(config)

@@ -74,29 +74,50 @@ pub fn replay_run(arena: Arena, tuning: Tuning, trace: &Trace) -> Result<Value, 
         return Err("replay command supports up to 32 recorded players".into());
     }
     let mut world = World::new(arena, Mode::Practice, tuning);
-    occupy(&mut world, count)?;
+    let host_capture = trace.header.source == "server-session";
+    if host_capture {
+        world.tick = trace.first_tick();
+    }
     let mut commands = Vec::with_capacity(count);
-    for tick in 0..trace.duration() {
+    let mut seeded = 0;
+    for elapsed in 0..trace.duration() {
         commands.clear();
         for slot in 0..count {
-            commands.push((
-                slot as u16 + 1,
-                Command {
-                    seq: tick + 1,
-                    seen_tick: world.tick,
-                    input: trace.input_at(slot, tick),
-                },
-            ));
+            let id = trace.track_id(slot);
+            if let Some(start) = trace.start_at(slot, elapsed) {
+                world.remove(id);
+                if !world.add_replay_player(start) {
+                    return Err(format!("unable to restore player {id}"));
+                }
+                seeded += 1;
+            }
+            if let Some(cmd) = trace.command_at(slot, elapsed, world.tick) {
+                if world.view(id).is_none() && !world.add(id) {
+                    return Err(format!("unable to add replay slot {id}"));
+                }
+                commands.push((id, cmd));
+            }
         }
         world.advance(&commands);
     }
-    let players:Vec<_> = world.views().iter().map(|p|json!({
-        "id":p.id,"position":p.body.pos.to_array(),"velocity":p.body.vel.to_array(),"hp":p.hp,"shot_tick":p.shot_tick
-    })).collect();
-    Ok(
-        json!({"map":trace.header.map,"workload":trace.header.source,"ticks":trace.duration(),
-        "players":players,"mode":"practice","start_state":"fresh match spawns; only input is recorded"}),
-    )
+    let players: Vec<_> = world
+        .views()
+        .iter()
+        .map(|p| {
+            json!({
+                "id":p.id, "position":p.body.pos.to_array(), "velocity":p.body.vel.to_array(),
+                "hp":p.hp, "shot_tick":p.shot_tick, "shots_fired":p.rifle.shots_fired,
+                "last_shot_direction":p.shot.map(|s| s.direction.to_array())
+            })
+        })
+        .collect();
+    Ok(json!({
+        "map":trace.header.map, "workload":trace.header.source, "ticks":trace.duration(),
+        "players":players, "mode":"practice", "capture_mode":trace.header.mode,
+        "friction":tuning.friction, "captured_start_states":seeded,
+        "start_state":if seeded > 0 {"captured player poses and rifles"} else {"fresh match spawns"},
+        "scope":"input drill; independent match events and network corrections are outside this recording"
+    }))
 }
 
 struct Traffic {
@@ -255,4 +276,145 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
             "scope":"serialized UDP payload only; latest unacknowledged commands (up to 6), immediate LAN acknowledgments at 32 Hz; no join/loss/IP headers"
         }
     }))
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use sendit_sim::{shot_seed, step, PlayerView};
+    use std::path::PathBuf;
+
+    fn temp(name: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sendit-{name}-{}-{nonce}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn assert_player(report: &Value, expected: &PlayerView) {
+        let p = &report["players"][0];
+        assert_eq!(p["id"], expected.id);
+        assert_eq!(p["position"], json!(expected.body.pos.to_array()));
+        assert_eq!(p["velocity"], json!(expected.body.vel.to_array()));
+        assert_eq!(p["shots_fired"], expected.rifle.shots_fired);
+        assert_eq!(
+            p["last_shot_direction"],
+            json!(expected.shot.unwrap().direction.to_array())
+        );
+    }
+
+    #[test]
+    fn sparse_host_recording_preserves_command_seed_hold_expiry_and_drill_reset() {
+        let path = temp("sparse");
+        let tune = Tuning {
+            friction: 7.2,
+            shot_interval_ticks: 3,
+            ..Tuning::default()
+        };
+        let arena = Arena::load("drill").unwrap();
+        let mut host = World::new(arena.clone(), Mode::Practice, tune);
+        host.tick = 800;
+        assert!(host.add_team(17, 1));
+        let mut writer =
+            TraceWriter::create_configured(&path, "drill", "server-session", Mode::Practice, tune)
+                .unwrap();
+        let mut gap_shots = 0;
+        for elapsed in 0..64 {
+            let input_tick = matches!(elapsed, 0 | 12 | 13 | 29 | 32 | 36 | 38 | 51 | 63);
+            if elapsed == 32 {
+                host.reset_through(17, 175);
+            }
+            let previous = *host.view(17).unwrap();
+            if input_tick {
+                let seq = 100 + 3 * elapsed;
+                let input = Input {
+                    strafe: 1.,
+                    fire: elapsed != 63,
+                    yaw: 0.631,
+                    ..Input::default()
+                };
+                let cmd = Command {
+                    seq,
+                    seen_tick: host.tick - 3,
+                    input,
+                };
+                writer.record_command(host.tick, cmd, previous).unwrap();
+                host.advance(&[(17, cmd)]);
+            } else {
+                host.advance(&[]);
+                if host.view(17).unwrap().shot_tick == host.tick {
+                    gap_shots += 1;
+                }
+            }
+        }
+        writer.flush().unwrap();
+        let trace = Trace::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(gap_shots > 2);
+        assert_eq!(trace.input_at(0, 8).strafe, 1.);
+        assert_eq!(trace.input_at(0, 9).strafe, 0.);
+        assert_eq!(trace.command_at(0, 0, 800).unwrap().seen_tick, 797);
+        let report = replay_run(arena, trace.header.tuning.unwrap(), &trace).unwrap();
+        assert_eq!(report["captured_start_states"], 2);
+        assert_player(&report, host.view(17).unwrap());
+        assert_eq!(
+            report["players"][0]["shot_tick"],
+            host.view(17).unwrap().shot_tick
+        );
+    }
+
+    #[test]
+    fn client_inputs_reproduce_nondefault_team_pose_weapon_and_sequence() {
+        let path = temp("client");
+        let tune = Tuning {
+            friction: 8.,
+            ..Tuning::default()
+        };
+        let arena = Arena::load("drill").unwrap();
+        let mut host = World::new(arena.clone(), Mode::Practice, tune);
+        assert!(host.add_team(9, 1));
+        let mut local = *host.view(9).unwrap();
+        local.body.pos.x += 0.72;
+        local.body.vel.z = 0.9;
+        local.rifle.ammo -= 4;
+        let mut writer =
+            TraceWriter::create_configured(&path, "drill", "test-client", Mode::Practice, tune)
+                .unwrap();
+        for sequence in 71..=211 {
+            let input = Input {
+                strafe: if sequence < 120 { 0.7 } else { -0.65 },
+                yaw: 1.72 + sequence as f32 * 0.00021,
+                pitch: 0.02,
+                fire: sequence % 47 < 25,
+                ..Input::default()
+            };
+            let command = Command {
+                seq: sequence,
+                input,
+                seen_tick: sequence - 5,
+            };
+            writer.record_client(command, local).unwrap();
+            step(&mut local.body, input, &arena, &tune);
+            if let Some(shot) = local.rifle.tick(
+                input,
+                &local.body,
+                sequence,
+                shot_seed(local.id, sequence),
+                &tune,
+            ) {
+                local.shot = Some(shot);
+            }
+        }
+        writer.flush().unwrap();
+        let trace = Trace::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(trace.header.tuning.unwrap().friction, tune.friction);
+        let report = replay_run(arena, tune, &trace).unwrap();
+        assert_player(&report, &local);
+    }
 }

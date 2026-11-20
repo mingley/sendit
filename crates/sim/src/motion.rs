@@ -26,6 +26,23 @@ pub struct Input {
 }
 
 impl Input {
+    /// Shared behavior between a missing network command and a sparse replay.
+    pub fn at_age(mut self, age: u32) -> Self {
+        if age > 8 {
+            return Self {
+                yaw: self.yaw,
+                pitch: self.pitch,
+                ..Self::default()
+            };
+        }
+        if age > 0 {
+            self.buy = false;
+            self.drop_bomb = false;
+            self.reload = false;
+        }
+        self
+    }
+
     /// Treat invalid analog values as neutral rather than poisoning replicated state.
     pub fn sanitized(mut self) -> Self {
         let finite = |value: f32| if value.is_finite() { value } else { 0.0 };

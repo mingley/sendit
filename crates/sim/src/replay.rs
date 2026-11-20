@@ -1,6 +1,6 @@
 //! Portable, tick-indexed input traces. The first JSON line describes the session.
 //! Subsequent lines contain one player's input or a named timing marker.
-use crate::Input;
+use crate::{Command, Input, Mode, PlayerView, Tuning, MAX_REWIND};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -9,7 +9,7 @@ use std::{
     path::Path,
 };
 
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const TICK_HZ: u16 = 128;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,39 +18,141 @@ pub struct TraceHeader {
     pub tick_hz: u16,
     pub map: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<Tuning>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum Event {
-    Sample { tick: u32, id: u16, input: Input },
-    Marker { tick: u32, marker: String },
+    Sample {
+        tick: u32,
+        id: u16,
+        input: Input,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewind: Option<u8>,
+    },
+    Start {
+        tick: u32,
+        state: PlayerView,
+    },
+    Marker {
+        tick: u32,
+        marker: String,
+    },
 }
 
 pub struct TraceWriter {
     file: BufWriter<File>,
     pending: usize,
+    last: BTreeMap<u16, (u32, u32)>,
 }
 
 impl TraceWriter {
     pub fn create(path: impl AsRef<Path>, map: &str, source: &str) -> io::Result<Self> {
+        Self::open(
+            path,
+            TraceHeader {
+                version: VERSION,
+                tick_hz: TICK_HZ,
+                map: map.to_owned(),
+                source: source.to_owned(),
+                mode: None,
+                tuning: None,
+            },
+        )
+    }
+
+    pub fn create_configured(
+        path: impl AsRef<Path>,
+        map: &str,
+        source: &str,
+        mode: Mode,
+        tuning: Tuning,
+    ) -> io::Result<Self> {
+        Self::open(
+            path,
+            TraceHeader {
+                version: VERSION,
+                tick_hz: TICK_HZ,
+                map: map.to_owned(),
+                source: source.to_owned(),
+                mode: Some(mode),
+                tuning: Some(tuning),
+            },
+        )
+    }
+
+    fn open(path: impl AsRef<Path>, header: TraceHeader) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = Self {
             file: BufWriter::new(file),
             pending: 0,
+            last: BTreeMap::new(),
         };
-        writer.line(&TraceHeader {
-            version: VERSION,
-            tick_hz: TICK_HZ,
-            map: map.to_owned(),
-            source: source.to_owned(),
-        })?;
+        writer.line(&header)?;
         writer.flush()?;
         Ok(writer)
     }
 
     pub fn record(&mut self, tick: u32, id: u16, input: Input) -> io::Result<()> {
-        self.line(&Event::Sample { tick, id, input })
+        self.line(&Event::Sample {
+            tick,
+            id,
+            input,
+            seq: None,
+            rewind: None,
+        })
+    }
+
+    fn start(&mut self, tick: u32, seq: u32, state: PlayerView) -> io::Result<()> {
+        let previous = self.last.insert(state.id, (state.life, seq));
+        if previous.is_none_or(|(life, last_seq)| {
+            life != state.life || (seq.wrapping_sub(last_seq) as i32) <= 0
+        }) {
+            self.line(&Event::Start { tick, state })?;
+        }
+        Ok(())
+    }
+
+    /// The host calls this immediately before consuming a newly accepted command.
+    pub fn record_command(
+        &mut self,
+        before_tick: u32,
+        cmd: Command,
+        state: PlayerView,
+    ) -> io::Result<()> {
+        self.start(before_tick, cmd.seq, state)?;
+        let age = before_tick.wrapping_add(1).wrapping_sub(cmd.seen_tick);
+        let rewind = if age > i32::MAX as u32 {
+            0
+        } else {
+            age.min(MAX_REWIND) as u8
+        };
+        self.line(&Event::Sample {
+            tick: before_tick,
+            id: state.id,
+            input: cmd.input,
+            seq: Some(cmd.seq),
+            rewind: Some(rewind),
+        })
+    }
+
+    /// Local predictions use the client's command sequence and pre-input pose.
+    /// The host decides the eventual rewind age after network transit.
+    pub fn record_client(&mut self, cmd: Command, state: PlayerView) -> io::Result<()> {
+        self.start(cmd.seq, cmd.seq, state)?;
+        self.line(&Event::Sample {
+            tick: cmd.seq,
+            id: state.id,
+            input: cmd.input,
+            seq: Some(cmd.seq),
+            rewind: None,
+        })
     }
 
     pub fn mark(&mut self, tick: u32, marker: &str) -> io::Result<()> {
@@ -76,10 +178,25 @@ impl TraceWriter {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Sample {
+    tick: u32,
+    input: Input,
+    seq: Option<u32>,
+    rewind: Option<u8>,
+}
+
+#[derive(Debug)]
+struct Track {
+    id: u16,
+    starts: BTreeMap<u32, PlayerView>,
+    samples: Vec<Sample>,
+}
+
 #[derive(Debug)]
 pub struct Trace {
     pub header: TraceHeader,
-    tracks: Vec<Vec<(u32, Input)>>,
+    tracks: Vec<Track>,
     markers: BTreeMap<String, u32>,
     first: u32,
     duration: u32,
@@ -100,13 +217,14 @@ impl Trace {
             .map_err(|e| e.to_string())?;
         let header: TraceHeader =
             serde_json::from_str(&line).map_err(|e| format!("replay header: {e}"))?;
-        if header.version != VERSION || header.tick_hz != TICK_HZ {
+        if !(1..=VERSION).contains(&header.version) || header.tick_hz != TICK_HZ {
             return Err(format!(
                 "unsupported replay version {} or tick rate {}",
                 header.version, header.tick_hz
             ));
         }
-        let mut tracks = BTreeMap::<u16, Vec<(u32, Input)>>::new();
+        let mut tracks = BTreeMap::<u16, Vec<Sample>>::new();
+        let mut starts = BTreeMap::<u16, BTreeMap<u32, PlayerView>>::new();
         let mut markers = BTreeMap::new();
         let (mut first, mut last) = (u32::MAX, 0);
         for (idx, line) in lines.enumerate() {
@@ -115,9 +233,36 @@ impl Trace {
             let event =
                 serde_json::from_str(&line).map_err(|e| format!("replay line {row}: {e}"))?;
             match event {
-                Event::Sample { tick, id, input } => {
+                Event::Start { tick, state } => {
+                    if state.team > 1
+                        || !state.body.pos.is_finite()
+                        || !state.body.vel.is_finite()
+                        || !state.yaw.is_finite()
+                        || !state.pitch.is_finite()
+                        || state.rifle.magazine == 0
+                        || state.rifle.magazine > crate::rifle::MAGAZINE
+                        || state.rifle.ammo > state.rifle.magazine
+                        || state.rifle.recoil_index >= 16
+                        || starts
+                            .entry(state.id)
+                            .or_default()
+                            .insert(tick, state)
+                            .is_some()
+                    {
+                        return Err(format!(
+                            "replay line {row}: invalid or duplicate starting state"
+                        ));
+                    }
+                }
+                Event::Sample {
+                    tick,
+                    id,
+                    input,
+                    seq,
+                    rewind,
+                } => {
                     let samples = tracks.entry(id).or_default();
-                    if samples.last().is_some_and(|(t, _)| *t >= tick) {
+                    if samples.last().is_some_and(|sample| sample.tick >= tick) {
                         return Err(format!(
                             "replay line {row}: ticks for player {id} must increase"
                         ));
@@ -129,7 +274,12 @@ impl Trace {
                     {
                         return Err(format!("replay line {row}: invalid input axes or angles"));
                     }
-                    samples.push((tick, input));
+                    samples.push(Sample {
+                        tick,
+                        input,
+                        seq,
+                        rewind,
+                    });
                     first = first.min(tick);
                     last = last.max(tick);
                 }
@@ -149,7 +299,14 @@ impl Trace {
         }
         Ok(Self {
             header,
-            tracks: tracks.into_values().collect(),
+            tracks: tracks
+                .into_iter()
+                .map(|(id, samples)| Track {
+                    id,
+                    starts: starts.remove(&id).unwrap_or_default(),
+                    samples,
+                })
+                .collect(),
             markers,
             first,
             duration,
@@ -164,6 +321,47 @@ impl Trace {
         self.tracks.len()
     }
 
+    pub fn track_id(&self, slot: usize) -> u16 {
+        self.tracks[slot].id
+    }
+
+    pub fn start_at(&self, slot: usize, elapsed: u32) -> Option<PlayerView> {
+        self.tracks[slot]
+            .starts
+            .get(&self.first.checked_add(elapsed)?)
+            .copied()
+    }
+
+    pub fn first_tick(&self) -> u32 {
+        self.first
+    }
+
+    /// Read the actual received command. An absent sample must reach the server
+    /// as a packet gap: the last accepted sequence is also part of the shot seed.
+    pub fn command_at(&self, slot: usize, elapsed: u32, simulation_tick: u32) -> Option<Command> {
+        if elapsed >= self.duration {
+            return None;
+        }
+        let samples = &self.tracks[slot].samples;
+        let tick = self.first + elapsed;
+        let index = samples
+            .binary_search_by_key(&tick, |sample| sample.tick)
+            .ok()?;
+        let sample = samples[index];
+        let fallback = if self.header.source == "human-client" {
+            tick
+        } else {
+            elapsed + 1
+        };
+        Some(Command {
+            seq: sample.seq.unwrap_or(fallback),
+            seen_tick: simulation_tick
+                .wrapping_add(1)
+                .wrapping_sub(u32::from(sample.rewind.unwrap_or(1))),
+            input: sample.input,
+        })
+    }
+
     /// Tick relative to the first input in the recording.
     pub fn marker(&self, name: &str) -> Option<u32> {
         self.markers.get(name).map(|tick| tick - self.first)
@@ -173,29 +371,16 @@ impl Trace {
     /// slots reuse tracks with a deterministic phase offset. Original tracks keep
     /// their relative timings. All tracks loop at the recorded session duration.
     pub fn input_at(&self, slot: usize, elapsed_ticks: u32) -> Input {
-        let track = &self.tracks[slot % self.tracks.len()];
+        let track = &self.tracks[slot % self.tracks.len()].samples;
         let repeat = (slot / self.tracks.len()) as u64;
         let offset = (u64::from(elapsed_ticks) + repeat * 97) % u64::from(self.duration);
         let tick = self.first + offset as u32;
-        let end = track.partition_point(|(t, _)| *t <= tick);
+        let end = track.partition_point(|sample| sample.tick <= tick);
         let Some(index) = end.checked_sub(1) else {
             return Input::default();
         };
-        let (sample, mut input) = track[index];
-        let age = tick - sample;
-        if age > 8 {
-            return Input {
-                yaw: input.yaw,
-                pitch: input.pitch,
-                ..Input::default()
-            };
-        }
-        if age > 0 {
-            input.buy = false;
-            input.drop_bomb = false;
-            input.reload = false;
-        }
-        input
+        let sample = track[index];
+        sample.input.at_age(tick - sample.tick)
     }
 }
 
@@ -214,6 +399,8 @@ mod tests {
             let event = Event::Sample {
                 tick,
                 id,
+                seq: None,
+                rewind: None,
                 input: Input {
                     forward,
                     ..Input::default()
@@ -236,6 +423,8 @@ mod tests {
         let entry = serde_json::to_string(&Event::Sample {
             tick: 7,
             id: 2,
+            seq: None,
+            rewind: None,
             input: Input::default(),
         })
         .unwrap();

@@ -107,32 +107,47 @@ fn valid_bounds(lo: Vec3, hi: Vec3) -> bool {
     in_world(lo) && in_world(hi) && (hi - lo).min_element() >= 0.001
 }
 
+fn embedded(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "drill" => Some(include_bytes!("../../../maps/drill.json")),
+        "relay" => Some(include_bytes!("../../../maps/relay.json")),
+        _ => None,
+    }
+}
+
+pub fn is_builtin(name: &str) -> bool {
+    embedded(name).is_some()
+}
+
 impl Arena {
     /// Built-in arenas are embedded in the server and client. Install additional files in
     /// SENDIT_MAP_DIR, or in maps/ relative to the working directory.
     pub fn load(name: &str) -> Result<Self, String> {
+        Self::load_with_source(name).map(|(arena, _)| arena)
+    }
+
+    /// Preserve the validated source of installed maps for clients joining this host.
+    pub fn load_with_source(name: &str) -> Result<(Self, Option<Vec<u8>>), String> {
         if !valid_map_name(name) {
             return Err("invalid map name (use letters, digits, dash, or underscore)".into());
         }
-        let arena = match name {
-            "drill" => Self::from_json(include_bytes!("../../../maps/drill.json"))?,
-            "relay" => Self::from_json(include_bytes!("../../../maps/relay.json"))?,
-            _ => {
-                let dir = std::env::var_os("SENDIT_MAP_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("maps"));
-                let path = dir.join(format!("{name}.json"));
-                let mut bytes = Vec::new();
-                File::open(&path)
-                    .and_then(|f| f.take(MAX_MAP_BYTES as u64 + 1).read_to_end(&mut bytes))
-                    .map_err(|e| format!("read {}: {e}", path.display()))?;
-                Self::from_json(&bytes)?
-            }
+        let (arena, source) = if let Some(bytes) = embedded(name) {
+            (Self::from_json(bytes)?, None)
+        } else {
+            let dir = std::env::var_os("SENDIT_MAP_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("maps"));
+            let path = dir.join(format!("{name}.json"));
+            let mut bytes = Vec::new();
+            File::open(&path)
+                .and_then(|f| f.take(MAX_MAP_BYTES as u64 + 1).read_to_end(&mut bytes))
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            (Self::from_json(&bytes)?, Some(bytes))
         };
         if arena.name != name {
             return Err(format!("map identifier in file must equal '{name}'"));
         }
-        Ok(arena)
+        Ok((arena, source))
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, String> {

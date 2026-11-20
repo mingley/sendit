@@ -103,7 +103,7 @@ def main():
         source = f"input replay ({header.get('source', 'unknown origin')})"
 
     with contextlib.ExitStack() as stack:
-        host = stack.enter_context(child(server, stdout=subprocess.PIPE))
+        host = stack.enter_context(child(server, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL))
         lines = messages(host)
         ready = wait_for(lines, lambda line: line.startswith("SENDIT_READY "), 10, [host])
         addr = re.search(r"addr=(\S+)", ready).group(1)

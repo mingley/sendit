@@ -1,6 +1,7 @@
 use crate::{
     audio::{Cue, Sound},
     benchmark::InputClock,
+    map_transfer::MapDownload,
     options::Options,
 };
 use bevy::{
@@ -25,6 +26,9 @@ use std::{
 pub struct Session {
     socket: UdpSocket,
     token: u64,
+    epoch_tick: u32,
+    epochs: u32,
+    download: Option<MapDownload>,
     pub id: Option<u16>,
     pub map: Arena,
     pub map_revision: u64,
@@ -99,6 +103,9 @@ impl Session {
         Ok(Self {
             socket,
             token: 0,
+            epoch_tick: 0,
+            epochs: 0,
+            download: None,
             id: None,
             map,
             map_revision: 1,
@@ -152,6 +159,87 @@ impl Session {
             // Inputs repeat in consecutive datagrams. A temporarily full local queue can skip one send.
             let _ = self.socket.send(&payload);
         }
+    }
+
+    fn welcome(
+        &mut self,
+        id: u16,
+        token: u64,
+        tick: u32,
+        map: &str,
+        mode: Mode,
+        tuning: Tuning,
+    ) -> Result<(), String> {
+        if self.id.is_some() {
+            if token == self.token {
+                // An acknowledgment can repeat while a client waits for its first input slot.
+                if id == self.id.unwrap() && map == self.server_map {
+                    self.last_packet = Instant::now();
+                }
+                return Ok(());
+            }
+            if older(tick, self.epoch_tick) || tick == self.epoch_tick {
+                return Ok(());
+            }
+        }
+        if !sendit_sim::map::valid_map_name(map) {
+            return Err("server sent an invalid map identifier".into());
+        }
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|trace| trace.header.map != map)
+        {
+            return Err(format!(
+                "input replay was recorded on a different map than {map}"
+            ));
+        }
+        if let Some(mut writer) = self.writer.take() {
+            writer
+                .flush()
+                .map_err(|e| format!("finish recording: {e}"))?;
+        }
+        self.epochs += 1;
+        self.id = Some(id);
+        self.token = token;
+        self.epoch_tick = tick;
+        self.server_tick = tick;
+        self.previous_tick = tick;
+        self.server_map = map.to_owned();
+        self.mode = mode;
+        self.tuning = tuning;
+        self.players.clear();
+        self.previous.clear();
+        self.names.clear();
+        self.pending.clear();
+        self.round = None;
+        self.rifle = Rifle::default();
+        self.sequence = 0;
+        self.accumulator = 0.;
+        self.spawn = None;
+        self.spectate = None;
+        self.reset_life = None;
+        self.last_snapshot = None;
+        self.last_packet = Instant::now();
+        self.last_ping = None;
+        self.rtt_ms = None;
+        self.local_shot = None;
+        self.local_shot_time = None;
+        self.hit_at = None;
+        self.damage_at = None;
+        self.rejected = false;
+        self.replay_tick = 0;
+        self.map_ready = sendit_sim::map::is_builtin(map);
+        self.download = if self.map_ready {
+            self.map = Arena::load(map)?;
+            self.map_revision += 1;
+            self.status = "Waiting for match state".into();
+            None
+        } else {
+            self.status = format!("Downloading map  {map}");
+            Some(MapDownload::new(map, token))
+        };
+        Ok(())
     }
 
     pub fn me(&self) -> Option<&PlayerView> {
@@ -254,9 +342,13 @@ impl Session {
         round: RoundView,
         audio: &mut Sound,
     ) {
-        if self.id.is_none() || (self.last_snapshot.is_some() && tick <= self.server_tick) {
+        if self.id.is_none()
+            || older(tick, self.epoch_tick)
+            || (self.last_snapshot.is_some() && !older(self.server_tick, tick))
+        {
             return;
         }
+        self.last_packet = Instant::now();
         let old_self = self.me().map(|p| (p.life, p.hp, p.kills));
         self.previous_tick = if self.last_snapshot.is_some() {
             self.server_tick
@@ -343,9 +435,12 @@ pub fn receive(
     mut s: ResMut<Session>,
     mut sound: ResMut<Sound>,
     mut exit: EventWriter<AppExit>,
+    mut bytes: Local<Vec<u8>>,
 ) {
     let now = Instant::now();
-    let mut bytes = [0u8; 65536];
+    if bytes.is_empty() {
+        bytes.resize(wire::MAX_PACKET + 1, 0u8);
+    }
     for _ in 0..64 {
         let len = match s.socket.recv(&mut bytes) {
             Ok(n) => n,
@@ -360,7 +455,6 @@ pub fn receive(
         let Ok(message) = wire::decode::<ServerMsg>(&bytes[..len]) else {
             continue;
         };
-        s.last_packet = now;
         match message {
             ServerMsg::Welcome {
                 id,
@@ -370,48 +464,51 @@ pub fn receive(
                 mode,
                 tuning,
             } => {
-                if s.id != Some(id) || s.token != token {
-                    s.last_snapshot = None;
-                    s.sequence = 0;
-                    s.players.clear();
-                    s.pending.clear();
-                    s.server_tick = tick;
+                if let Err(e) = s.welcome(id, token, tick, &map, mode, tuning) {
+                    eprintln!("{e}");
+                    exit.send(AppExit::error());
                 }
-                s.token = token;
-                s.id = Some(id);
-                s.mode = mode;
-                s.tuning = tuning;
-                if s.server_map != map || !s.map_ready {
-                    s.map_ready = false;
-                    if let Ok(arena) = Arena::load(&map) {
+            }
+            ServerMsg::MapChunk {
+                token,
+                map,
+                part,
+                count,
+                data,
+            } => {
+                if token != s.token || map != s.server_map {
+                    continue;
+                }
+                let Some(download) = &mut s.download else {
+                    continue;
+                };
+                match download.accept(token, &map, part, count, data) {
+                    Ok(Some(arena)) => {
                         s.map = arena;
                         s.map_ready = true;
                         s.map_revision += 1;
+                        s.download = None;
+                        s.last_packet = now;
+                        s.status = "Waiting for match state".into();
+                        s.replay_pending();
+                        println!(
+                            "MAP_READY {} solids={} ramps={}",
+                            s.server_map,
+                            s.map.boxes.len(),
+                            s.map.ramps.len()
+                        );
                     }
-                    if s.replay
-                        .as_ref()
-                        .is_some_and(|trace| trace.header.map != map)
-                    {
-                        eprintln!("input replay was recorded on a different map");
-                        exit.send(AppExit::error());
+                    Ok(None) => {
+                        s.last_packet = now;
                     }
-                    s.server_map = map;
-                }
-                s.status = if s.map_ready {
-                    "Waiting for match state".into()
-                } else {
-                    "Waiting for map".into()
-                };
-            }
-            ServerMsg::MapData { map, data } => {
-                if map == s.server_map {
-                    match Arena::from_json(&data) {
-                        Ok(arena) => {
-                            s.map = arena;
-                            s.map_ready = true;
-                            s.map_revision += 1;
+                    Err(e) => {
+                        s.download = None;
+                        s.rejected = true;
+                        s.status = format!("Map rejected | {e}");
+                        eprintln!("{}", s.status);
+                        if opts.benchmark.is_some() {
+                            exit.send(AppExit::error());
                         }
-                        Err(e) => s.status = format!("Map rejected | {e}"),
                     }
                 }
             }
@@ -447,6 +544,11 @@ pub fn receive(
                     exit.send(AppExit::error());
                 }
             }
+            ServerMsg::Challenge { token } => {
+                if s.id.is_none() && !s.rejected {
+                    s.send(&ClientMsg::Confirm { token });
+                }
+            }
             ServerMsg::Pong { nonce } => {
                 if let Some((n, sent)) = s.last_ping {
                     if n == nonce {
@@ -458,6 +560,9 @@ pub fn receive(
     }
     if s.id.is_some() && s.last_packet.elapsed() > Duration::from_secs(5) {
         s.id = None;
+        s.download = None;
+        s.names.clear();
+        s.map_ready = false;
         s.players.clear();
         s.pending.clear();
         s.last_snapshot = None;
@@ -475,17 +580,14 @@ pub fn receive(
         });
         s.last_join = Some(now);
     }
-    if s.id.is_some()
-        && !s.map_ready
-        && s.last_join
-            .is_none_or(|i| i.elapsed() > Duration::from_secs(1))
-    {
-        s.send(&ClientMsg::Join {
-            version: wire::PROTOCOL,
-            name: opts.name.clone(),
-            password: opts.password.clone(),
-        });
-        s.last_join = Some(now);
+    if let Some(download) = &mut s.download {
+        let requests = download.requests(now);
+        for part in requests {
+            s.send(&ClientMsg::MapRequest {
+                token: s.token,
+                part,
+            });
+        }
     }
     if s.id.is_some()
         && s.last_ping
@@ -497,7 +599,26 @@ pub fn receive(
     }
     if s.id.is_some() && s.last_snapshot.is_some() && s.writer.is_none() && !s.recording_failed {
         if let Some(file) = &opts.record {
-            match TraceWriter::create(file, &s.server_map, "human-client") {
+            // Keep a separate trace per authoritative world, including same-map restarts.
+            let destination = if s.epochs <= 1 {
+                file.clone()
+            } else {
+                let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = file.extension().unwrap_or_default().to_string_lossy();
+                let mut name = format!("{stem}.{}-{}", s.server_map, s.epochs);
+                if !ext.is_empty() {
+                    name.push('.');
+                    name.push_str(&ext);
+                }
+                file.with_file_name(name)
+            };
+            match TraceWriter::create_configured(
+                &destination,
+                &s.server_map,
+                "human-client",
+                s.mode,
+                s.tuning,
+            ) {
                 Ok(writer) => s.writer = Some(writer),
                 Err(e) => {
                     s.recording_failed = true;
@@ -612,6 +733,10 @@ pub fn sample(
     }
 }
 
+fn older(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
 // A deterministic camera route for graphical measurements without a recorded human session.
 fn benchmark_command(tick: u32) -> Input {
     let turn = (tick % 1536) as f32 / 1536. * std::f32::consts::TAU;
@@ -640,9 +765,10 @@ pub fn predict(
 ) {
     let s = &mut *session;
     let Some(id) = s.id else { return };
-    if !s.map_ready || s.me().is_none() {
+    if !s.map_ready {
         return;
     }
+    let Some(me) = s.me().copied() else { return };
     if let Some((life, since, last)) = s.reset_life {
         if since.elapsed() < Duration::from_millis(600) {
             if last.elapsed() > Duration::from_millis(120) {
@@ -681,7 +807,12 @@ pub fn predict(
             input,
         };
         if let Some(writer) = &mut s.writer {
-            if let Err(e) = writer.record(command.seq, id, input) {
+            let state = PlayerView {
+                body: s.body,
+                rifle: s.rifle,
+                ..me
+            };
+            if let Err(e) = writer.record_client(command, state) {
                 s.writer = None;
                 s.recording_failed = true;
                 s.status = format!("Recording failed | {e}");
@@ -787,6 +918,39 @@ mod tests {
         let server = world.view(7).unwrap();
         assert_eq!(client.body.pos, server.body.pos);
         assert_eq!(client.rifle, server.rifle);
+    }
+
+    #[test]
+    fn rotation_to_same_custom_map_rejects_old_welcomes_and_snapshots() {
+        let mut client = Session::open(&Options::default()).unwrap();
+        let tuning = Tuning::default();
+        client
+            .welcome(2, 11, 100, "custom-arena", Mode::Practice, tuning)
+            .unwrap();
+        assert!(!client.map_ready);
+        assert!(client.download.is_some());
+        client.pending.push_back(Command::default());
+        client
+            .welcome(2, 22, 200, "custom-arena", Mode::Deathmatch, tuning)
+            .unwrap();
+        assert_eq!(client.epochs, 2);
+        assert!(client.pending.is_empty());
+        assert!(client.download.is_some());
+        let mut audio = Sound::new(false);
+        client.snapshot(199, vec![], RoundView::default(), &mut audio);
+        assert!(client.last_snapshot.is_none());
+        client
+            .welcome(2, 11, 100, "custom-arena", Mode::Practice, tuning)
+            .unwrap();
+        assert_eq!((client.token, client.mode), (22, Mode::Deathmatch));
+        client.snapshot(200, vec![], RoundView::default(), &mut audio);
+        assert!(client.last_snapshot.is_some());
+        client.id = None; // Existing endpoint timed out; a fresh server can have a lower tick.
+        client
+            .welcome(8, 90, 3, "drill", Mode::Practice, tuning)
+            .unwrap();
+        assert_eq!(client.epoch_tick, 3);
+        assert!(client.map_ready);
     }
 
     #[test]

@@ -1,7 +1,10 @@
+mod management;
+
 use crate::config::Config;
+use crate::discovery::{self, Listing, Publisher};
 use crate::stats::Traffic;
 use sendit_sim::replay::TraceWriter;
-use sendit_sim::wire::{decode, encode, ClientMsg, Command, ServerMsg, PROTOCOL};
+use sendit_sim::wire::{decode, encode, ClientMsg, Command, ServerMsg, CHUNK_BYTES, PROTOCOL};
 use sendit_sim::{Arena, Mode, World};
 use std::collections::BTreeMap;
 use std::io;
@@ -15,14 +18,33 @@ const MAX_CLIENT_PACKET: usize = 4096;
 const SNAPSHOT_INTERVAL: u32 = 4;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
+const PENDING_LIMIT: usize = 256;
+const CHALLENGE_TTL: Duration = Duration::from_secs(3);
+
+struct PendingJoin {
+    proof: u64,
+    name: String,
+    issued: Instant,
+}
+
 struct Session {
     id: u16,
     name: String,
     token: u64,
     last_packet: Instant,
+    last_welcome: Option<Instant>,
     last_seq: u32,
     last_reset: Option<u32>,
+    pending_welcome: bool,
+    chunk_window: u32,
+    chunk_count: u8,
     pending: Vec<Command>,
+}
+
+fn new_token() -> io::Result<u64> {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(u64::from_ne_bytes(random))
 }
 
 fn follows(seq: u32, prev: u32) -> bool {
@@ -84,7 +106,13 @@ pub struct Host {
     pub config: Config,
     socket: UdpSocket,
     sessions: BTreeMap<SocketAddr, Session>,
+    challenges: BTreeMap<SocketAddr, PendingJoin>,
     trace: Option<TraceWriter>,
+    trace_serial: u32,
+    custom_source: Option<Vec<u8>>,
+    map_started: Instant,
+    publisher: Publisher,
+    listing: Listing,
     roster_changed: bool,
     inputs: Vec<(u16, Command)>,
     pub traffic: Traffic,
@@ -92,7 +120,12 @@ pub struct Host {
 
 impl Host {
     pub fn bind(config: Config) -> Result<Self, String> {
-        let arena = Arena::load(&config.map)?;
+        let (arena, custom_source) = Arena::load_with_source(&config.map)?;
+        for name in &config.rotation {
+            if name != &config.map {
+                Arena::load(name).map_err(|e| format!("rotation {name}: {e}"))?;
+            }
+        }
         let mut world = World::new(arena, config.mode, config.tuning);
         world.set_dm_loadout(config.dm_loadout);
         let socket =
@@ -101,16 +134,37 @@ impl Host {
         let trace = config
             .record
             .as_ref()
-            .map(|path| TraceWriter::create(path, &config.map, "server-session"))
+            .map(|path| {
+                TraceWriter::create_configured(
+                    path,
+                    &config.map,
+                    "server-session",
+                    config.mode,
+                    config.tuning,
+                )
+            })
             .transpose()
             .map_err(|e| format!("open replay: {e}"))?;
         Ok(Self {
             inputs: Vec::with_capacity(usize::from(config.capacity)),
+            publisher: Publisher::new(config.directory),
+            listing: Listing {
+                name: config.name.clone(),
+                map: config.map.clone(),
+                mode: config.mode,
+                players: 0,
+                cap: config.capacity,
+                locked: !config.password.is_empty(),
+            },
+            trace_serial: 1,
+            custom_source,
+            map_started: Instant::now(),
             world,
             socket,
             config,
             trace,
             sessions: BTreeMap::new(),
+            challenges: BTreeMap::new(),
             roster_changed: false,
             traffic: Traffic::default(),
         })
@@ -188,37 +242,84 @@ impl Host {
             return self.send(addr, ServerMsg::Rejected(reason.into()));
         }
 
-        let (id, token) = if let Some(session) = self.sessions.get_mut(&addr) {
-            session.last_packet = now;
-            (session.id, session.token)
+        if self.sessions.contains_key(&addr) {
+            return self.repeat_welcome(addr, now);
+        }
+        if self.sessions.len() >= usize::from(self.config.capacity) {
+            return self.send(addr, ServerMsg::Rejected("server full".into()));
+        }
+        let proof = if let Some(pending) = self.challenges.get(&addr) {
+            pending.proof
         } else {
-            let id = (1..=self.config.capacity)
-                .find(|id| self.sessions.values().all(|session| session.id != *id));
-            let Some(id) = id else {
-                return self.send(addr, ServerMsg::Rejected("server full".into()));
-            };
-            let mut random = [0u8; 8];
-            getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
-            let token = u64::from_ne_bytes(random);
-            if !self.world.add(id) {
-                return self.send(addr, ServerMsg::Rejected("no free player slot".into()));
+            if self.challenges.len() >= PENDING_LIMIT {
+                return Ok(());
             }
-            self.roster_changed = true;
-            self.sessions.insert(
+            let proof = new_token()?;
+            self.challenges.insert(
                 addr,
-                Session {
-                    id,
+                PendingJoin {
+                    proof,
                     name: name.chars().take(24).collect(),
-                    token,
-                    last_packet: now,
-                    last_seq: 0,
-                    last_reset: None,
-                    pending: Vec::with_capacity(MAX_QUEUED_COMMANDS),
+                    issued: now,
                 },
             );
-            println!("join id={id} name={name:?}");
-            (id, token)
+            proof
         };
+        self.send(addr, ServerMsg::Challenge { token: proof })
+    }
+
+    fn confirm(&mut self, addr: SocketAddr, proof: u64, now: Instant) -> io::Result<()> {
+        if self.sessions.get(&addr).is_some_and(|s| s.token == proof) {
+            return self.repeat_welcome(addr, now);
+        }
+        if !self.challenges.get(&addr).is_some_and(|p| p.proof == proof) {
+            return Ok(());
+        }
+        let pending = self.challenges.remove(&addr).unwrap();
+        let id = (1..=self.config.capacity).find(|id| self.sessions.values().all(|s| s.id != *id));
+        let Some(id) = id else {
+            return self.send(addr, ServerMsg::Rejected("server full".into()));
+        };
+        if !self.world.add(id) {
+            return self.send(addr, ServerMsg::Rejected("no free player slot".into()));
+        }
+        self.roster_changed = true;
+        println!("join id={id} name={:?}", pending.name);
+        self.sessions.insert(
+            addr,
+            Session {
+                id,
+                name: pending.name,
+                token: proof,
+                last_packet: now,
+                last_welcome: None,
+                last_seq: 0,
+                last_reset: None,
+                pending_welcome: true,
+                chunk_window: 0,
+                chunk_count: 0,
+                pending: Vec::with_capacity(MAX_QUEUED_COMMANDS),
+            },
+        );
+        self.repeat_welcome(addr, now)
+    }
+
+    fn repeat_welcome(&mut self, addr: SocketAddr, now: Instant) -> io::Result<()> {
+        let session = self.sessions.get_mut(&addr).unwrap();
+        if session
+            .last_welcome
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+        {
+            return Ok(());
+        }
+        session.last_welcome = Some(now);
+        self.welcome(addr)?;
+        self.send(addr, self.snapshot())
+    }
+
+    fn welcome(&mut self, addr: SocketAddr) -> io::Result<()> {
+        let session = &self.sessions[&addr];
+        let (id, token) = (session.id, session.token);
         self.send(
             addr,
             ServerMsg::Welcome {
@@ -229,8 +330,44 @@ impl Host {
                 mode: self.config.mode,
                 tuning: self.config.tuning,
             },
-        )?;
-        self.send(addr, self.snapshot())
+        )
+    }
+
+    fn map_chunk(
+        &mut self,
+        addr: SocketAddr,
+        token: u64,
+        part: u8,
+        now: Instant,
+    ) -> io::Result<()> {
+        let Some(session) = self.sessions.get_mut(&addr).filter(|s| s.token == token) else {
+            return Ok(());
+        };
+        let Some(source) = self.custom_source.as_deref() else {
+            return Ok(());
+        };
+        let Some(chunk) = source.chunks(CHUNK_BYTES).nth(usize::from(part)) else {
+            return Ok(());
+        };
+        let window = self.world.tick / 16;
+        if session.chunk_window != window {
+            session.chunk_window = window;
+            session.chunk_count = 0;
+        }
+        if session.chunk_count < 16 {
+            session.chunk_count += 1;
+            session.last_packet = now;
+            session.pending_welcome = false;
+            let packet = ServerMsg::MapChunk {
+                token,
+                map: self.config.map.clone(),
+                part,
+                count: source.len().div_ceil(CHUNK_BYTES) as u8,
+                data: chunk.to_vec(),
+            };
+            self.send(addr, packet)?;
+        }
+        Ok(())
     }
 
     fn receive(&mut self, now: Instant) -> io::Result<()> {
@@ -242,14 +379,22 @@ impl Host {
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
             };
-            self.traffic.received += len as u64;
             if len > MAX_CLIENT_PACKET {
                 continue;
             }
+            if discovery::matches(&buffer[..len]) {
+                self.listing.players = self.sessions.len() as u16;
+                self.publisher
+                    .receive(&self.socket, addr, &buffer[..len], &self.listing);
+                continue;
+            }
+            self.traffic.received += len as u64;
             let Ok(message) = decode::<ClientMsg>(&buffer[..len]) else {
                 continue;
             };
             match message {
+                ClientMsg::MapRequest { token, part } => self.map_chunk(addr, token, part, now)?,
+                ClientMsg::Confirm { token } => self.confirm(addr, token, now)?,
                 ClientMsg::Ping { nonce } => self.send(addr, ServerMsg::Pong { nonce })?,
                 ClientMsg::Join {
                     version,
@@ -263,6 +408,7 @@ impl Host {
                     if let Some(session) = self.sessions.get_mut(&addr).filter(|s| s.token == token)
                     {
                         session.last_packet = now;
+                        session.pending_welcome = false;
                         for command in commands {
                             session.enqueue(command);
                         }
@@ -295,6 +441,9 @@ impl Host {
     }
 
     pub fn step(&mut self, now: Instant) -> io::Result<()> {
+        self.rotate_if_due(now);
+        self.challenges
+            .retain(|_, entry| now.duration_since(entry.issued) < CHALLENGE_TTL);
         self.receive(now)?;
         self.inputs.clear();
         self.sessions.retain(|_, session| {
@@ -312,11 +461,28 @@ impl Host {
         self.inputs.sort_unstable_by_key(|(id, _)| *id);
         if let Some(trace) = &mut self.trace {
             for (id, command) in &self.inputs {
-                trace.record(self.world.tick, *id, command.input)?;
+                if let Some(view) = self.world.view(*id) {
+                    trace.record_command(self.world.tick, *command, *view)?;
+                }
             }
         }
         self.world.advance(&self.inputs);
+        if self.config.directory.is_some() && self.world.tick % sendit_sim::TICK_RATE == 1 {
+            self.listing.players = self.sessions.len() as u16;
+            self.publisher.heartbeat(&self.socket, now, &self.listing);
+        }
         if !self.sessions.is_empty() {
+            if self.world.tick % (sendit_sim::TICK_RATE / 2) == 0 {
+                let retry: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .filter(|(_, s)| s.pending_welcome)
+                    .map(|(addr, _)| *addr)
+                    .collect();
+                for addr in retry {
+                    self.welcome(addr)?;
+                }
+            }
             if self.world.tick % SNAPSHOT_INTERVAL == 0 {
                 self.broadcast(self.snapshot())?;
             }
@@ -348,6 +514,10 @@ mod tests {
             name: "test".into(),
             token: 1,
             last_packet: Instant::now(),
+            last_welcome: None,
+            pending_welcome: false,
+            chunk_window: 0,
+            chunk_count: 0,
             last_seq: u32::MAX - 2,
             last_reset: None,
             pending: vec![],
@@ -431,11 +601,24 @@ mod tests {
         request(&mut host, &alice, join("incorrect"));
         assert!(matches!(receive(&alice), ServerMsg::Rejected(_)));
         request(&mut host, &alice, join("test-room"));
+        let ServerMsg::Challenge { token } = receive(&alice) else {
+            panic!("expected proof challenge")
+        };
+        assert_eq!(host.connected(), 0);
+        request(&mut host, &bob, ClientMsg::Confirm { token });
+        assert_eq!(host.connected(), 0);
+        request(&mut host, &alice, ClientMsg::Confirm { token });
         let ServerMsg::Welcome { token, .. } = receive(&alice) else {
             panic!("expected welcome")
         };
         assert!(matches!(receive(&alice), ServerMsg::Snapshot { .. }));
-        let ServerMsg::Roster { players } = receive(&alice) else {
+        let roster = loop {
+            let message = receive(&alice);
+            if !matches!(message, ServerMsg::Snapshot { .. }) {
+                break message;
+            }
+        };
+        let ServerMsg::Roster { players } = roster else {
             panic!("expected roster")
         };
         assert_eq!(players, vec![(1, "test".into())]);
@@ -445,6 +628,10 @@ mod tests {
         assert!(matches!(receive(&bob), ServerMsg::Rejected(_)));
         request(&mut host, &alice, ClientMsg::Leave { token });
         request(&mut host, &bob, join("test-room"));
+        let ServerMsg::Challenge { token } = receive(&bob) else {
+            panic!("expected Bob challenge")
+        };
+        request(&mut host, &bob, ClientMsg::Confirm { token });
         assert!(matches!(receive(&bob), ServerMsg::Welcome { .. }));
         assert_eq!(host.connected(), 1);
     }

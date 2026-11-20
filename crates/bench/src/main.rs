@@ -56,7 +56,10 @@ impl Options {
     }
 
     fn tuning(&mut self) -> Result<Tuning, String> {
-        let mut tuning = Tuning::default();
+        self.tuning_from(Tuning::default())
+    }
+
+    fn tuning_from(&mut self, mut tuning: Tuning) -> Result<Tuning, String> {
         tuning.friction = self.value("--friction", tuning.friction)?;
         if !tuning.friction.is_finite() || !(0.0..=64.0).contains(&tuning.friction) {
             return Err("--friction must be in [0, 64]".into());
@@ -112,7 +115,7 @@ fn run() -> Result<Option<Value>, String> {
         "replay" => {
             let path = opts.required("--file")?;
             let trace = Trace::load(path)?;
-            let tuning = opts.tuning()?;
+            let tuning = opts.tuning_from(trace.header.tuning.unwrap_or_default())?;
             opts.finish()?;
             let arena = Arena::load(&trace.header.map)?;
             if trace.header.source == "scripted-peek" {

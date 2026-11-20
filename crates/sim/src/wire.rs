@@ -4,7 +4,9 @@ use crate::{Input, Mode, PlayerView, RoundView, Tuning};
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
+/// Custom maps travel as individually requested sub-MTU datagrams.
+pub const CHUNK_BYTES: usize = 900;
 pub const MAX_PACKET: usize = 60_000;
 /// At most this many recent, unacknowledged commands accompany each client tick.
 pub const INPUT_REDUNDANCY: usize = 6;
@@ -23,6 +25,9 @@ pub enum ClientMsg {
         name: String,
         password: String,
     },
+    Confirm {
+        token: u64,
+    },
     Input {
         token: u64,
         commands: Vec<Command>,
@@ -34,6 +39,10 @@ pub enum ClientMsg {
     Leave {
         token: u64,
     },
+    MapRequest {
+        token: u64,
+        part: u8,
+    },
     Ping {
         nonce: u64,
     },
@@ -41,6 +50,9 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
+    Challenge {
+        token: u64,
+    },
     Welcome {
         id: u16,
         token: u64,
@@ -61,8 +73,11 @@ pub enum ServerMsg {
     Pong {
         nonce: u64,
     },
-    MapData {
+    MapChunk {
+        token: u64,
         map: String,
+        part: u8,
+        count: u8,
         data: Vec<u8>,
     },
 }

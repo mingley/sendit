@@ -1,26 +1,29 @@
+mod hosting;
 mod net;
 mod rules;
 mod scenario;
 
 use net::Impairment;
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HELP: &str = "Sendit UDP probe
 
   sendit-probe verify [--server PATH]
   sendit-probe verify-rules [--server PATH]
+  sendit-probe verify-hosting [--server PATH]
   sendit-probe smoke [--connect HOST:PORT] [--latency-ms N] [--jitter-ms N] [--loss-pct N] [--seed N]
   sendit-probe load [--connect HOST:PORT] [--players N] [--seconds N] [--replay FILE]
 
 verify launches two fresh drill servers, testing both LAN conditions and a seeded impaired link.
 verify-rules tests competitive bomb play and deathmatch loadouts on separate local servers.
+verify-hosting starts a local directory and community hosts to check operator and player workflows.
 smoke expects an empty practice server on the drill map. Latency and jitter apply in each direction.
 load occupies a live server. Without an input trace it uses a synthetic movement and firing pattern.
 Use --password-env NAME to join a protected smoke or load server.";
@@ -90,46 +93,75 @@ impl Options {
     }
 }
 
-struct Server(Child);
+struct Server {
+    process: Child,
+    lines: mpsc::Receiver<String>,
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
     }
 }
 
-fn start_server(path: &Path, options: &[&str]) -> Result<(Server, SocketAddr), String> {
-    let child = Command::new(path)
-        .args(["--bind", "127.0.0.1:0"])
-        .args(options)
+impl Server {
+    fn admin(&mut self, command: &str) -> Result<(), String> {
+        let input = self.process.stdin.as_mut().ok_or("server stdin closed")?;
+        writeln!(input, "{command}")
+            .and_then(|()| input.flush())
+            .map_err(|e| e.to_string())
+    }
+
+    fn wait_line(&self, matches: impl Fn(&str) -> bool, seconds: u64) -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let line = self
+                .lines
+                .recv_timeout(remaining)
+                .map_err(|_| "server exited or timed out waiting for output")?;
+            if matches(&line) {
+                return Ok(line);
+            }
+        }
+        Err("no matching line from server".into())
+    }
+}
+
+fn start_service(mut command: Command, prefix: &str) -> Result<(Server, SocketAddr), String> {
+    let mut child = command
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| {
-            format!(
-                "couldn't launch {}: {e}; build sendit-server first",
-                path.display()
-            )
-        })?;
-    let mut owner = Server(child);
-    let pipe = owner.0.stdout.take().ok_or("missing server stdout")?;
+        .map_err(|e| format!("launch {}: {e}", command.get_program().to_string_lossy()))?;
+    let pipe = child.stdout.take().ok_or("missing server stdout")?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-            if let Some(suffix) = line.strip_prefix("SENDIT_READY ") {
-                for word in suffix.split_whitespace() {
-                    if let Some(addr) = word.strip_prefix("addr=") {
-                        let _ = tx.send(addr.parse::<SocketAddr>().map_err(|e| e.to_string()));
-                        break;
-                    }
-                }
+            if tx.send(line).is_err() {
+                break;
             }
         }
     });
-    let addr = rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| "server exited or did not report readiness")??;
-    Ok((owner, addr))
+    let server = Server {
+        process: child,
+        lines: rx,
+    };
+    let line = server.wait_line(|line| line.starts_with(prefix), 10)?;
+    let addr = line
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("addr="))
+        .ok_or("missing listen address")?
+        .parse::<SocketAddr>()
+        .map_err(|e| e.to_string())?;
+    Ok((server, addr))
+}
+
+fn start_server(path: &Path, options: &[&str]) -> Result<(Server, SocketAddr), String> {
+    let mut command = Command::new(path);
+    command.args(["--bind", "127.0.0.1:0"]).args(options);
+    start_service(command, "SENDIT_READY ")
 }
 
 fn run() -> Result<(), String> {
@@ -155,6 +187,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "verify-rules" => rules::verify(&o.server),
+        "verify-hosting" => hosting::verify(&o.server),
         "smoke" => scenario::smoke(&o.addr, &o.password, o.net),
         "load" => scenario::load(
             &o.addr,

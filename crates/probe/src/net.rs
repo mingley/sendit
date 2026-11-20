@@ -94,6 +94,12 @@ impl Frame {
     }
 }
 
+pub struct MapPart {
+    pub index: u8,
+    pub count: u8,
+    pub bytes: Vec<u8>,
+}
+
 pub struct Peer {
     socket: UdpSocket,
     outgoing: Queue,
@@ -104,6 +110,9 @@ pub struct Peer {
     pub id: Option<u16>,
     pub token: u64,
     pub map: String,
+    pub map_part: Option<MapPart>,
+    pub roster: Vec<(u16, String)>,
+    epoch_start: u32,
     pub mode: Mode,
     pub tuning: Tuning,
     pub predicted: Option<Body>,
@@ -139,6 +148,9 @@ impl Peer {
             id: None,
             token: 0,
             map: String::new(),
+            map_part: None,
+            roster: Vec::new(),
+            epoch_start: 0,
             mode: Mode::Practice,
             tuning: Tuning::default(),
             predicted: None,
@@ -212,6 +224,9 @@ impl Peer {
         {
             return;
         }
+        if frame.tick < self.epoch_start {
+            return;
+        }
         let own = self.id.and_then(|id| frame.player(id));
         if let Some(own) = own {
             // Match the desktop sender: a received snapshot retires ACKed inputs.
@@ -265,14 +280,32 @@ impl Peer {
         }
         while let Some(bytes) = self.incoming.pop() {
             match decode::<ServerMsg>(&bytes)? {
+                ServerMsg::Challenge { token } => {
+                    self.send(ClientMsg::Confirm { token })?;
+                }
                 ServerMsg::Welcome {
                     id,
                     token,
                     map,
                     mode,
                     tuning,
-                    ..
+                    tick,
                 } => {
+                    if self.id.is_some() && tick < self.epoch_start {
+                        continue;
+                    }
+                    if self.id.is_some() && self.token != token {
+                        self.recent.clear();
+                        self.pending.clear();
+                        self.latest = None;
+                        self.life = None;
+                        self.map_part = None;
+                        self.predicted = None;
+                        self.seq = 0;
+                    }
+                    if self.id.is_none() || self.token != token {
+                        self.epoch_start = tick;
+                    }
                     if self.id.is_some_and(|old| old != id) {
                         return Err("slot changed during probe".into());
                     }
@@ -294,6 +327,22 @@ impl Peer {
                     },
                     arena,
                 ),
+                ServerMsg::MapChunk {
+                    token,
+                    map,
+                    part,
+                    count,
+                    data,
+                } if token == self.token && map == self.map => {
+                    self.map_part = Some(MapPart {
+                        index: part,
+                        count,
+                        bytes: data,
+                    });
+                }
+                ServerMsg::Roster { players } => {
+                    self.roster = players;
+                }
                 ServerMsg::Rejected(reason) => {
                     return Err(format!("server rejected join or input: {reason}"))
                 }
