@@ -374,7 +374,8 @@ class Playtest:
         stack.callback(lambda: shutil.copy2(trace, self.out / trace.name) if trace.exists() else None)
         client, _ = self.window(stack, label, "--connect", addr, "--name", "PlayerQA",
                                 "--width", "1280", "--height", "720")
-        self.log_match(host, log, r'join id=\d+ name="PlayerQA"')
+        joined = self.log_match(host, log, r'join id=(\d+) name="PlayerQA"')
+        self.player_id = int(joined[1])
         wait_for("server-recorded native commands", lambda: len(samples(trace)) > 12, 15)
         self.desk.click((self.desk.geometry[2] // 2, self.desk.geometry[3] // 2))
         return host, trace
@@ -564,7 +565,8 @@ class Playtest:
                 # A new round emits the real server's starting PlayerView; its
                 # persistent K/D cannot be produced by predicted fire alone.
                 won = next((row["state"] for row in trace_events(trace)
-                            if row.get("state", {}).get("kills", 0) >= 1), None)
+                            if row.get("state", {}).get("id") == self.player_id
+                            and row["state"]["kills"] >= 1), None)
                 if won:
                     break
                 time.sleep(.045)
@@ -578,10 +580,20 @@ class Playtest:
             board = self.photo("duel-scoreboard")
             d.key("Tab", False)
             w, h = board.size
-            text = ocr(board.crop((w//2-315, int(h*.08), w//2+315, int(h*.7))), 6)
-            self.check("Live scoreboard contains the player and a bot",
-                       "playerqa" in text.replace(" ", "").lower() and "bot" in text.lower(),
-                       scoreboard=text)
+            region = board.crop((w//2-292, int(h*.115), w//2+292, int(h*.34)))
+            text = ocr(region, 6)
+            # Read the pale player rows independently of the warm team headers.
+            glyphs = np.asarray(region).min(axis=2) > 138
+            rows = Image.fromarray(np.uint8(np.where(glyphs, 0, 255)))
+            row_text = ocr(ImageOps.expand(rows.resize((rows.width*2, rows.height*2)), 6, 255), 6)
+            host.stdin.write(b"status\n")
+            host.stdin.flush()
+            roster = self.log_match(host, self.out / "duel-host.log", r"humans=1 bots=1")
+            self.check("Tab shows the two-player match and its recorded result",
+                       roster is not None and "ROUND" in text.upper() and
+                       "PLAYER" in row_text.upper() and "BOT" in row_text.upper(),
+                       player_id=self.player_id, authoritative_kills=won["kills"],
+                       authoritative_deaths=won["deaths"], scoreboard=text, rows=row_text)
             self.quit()
             host.stdin.write(b"quit\n")
             host.stdin.flush()
