@@ -5,7 +5,7 @@ const HELP: &str =
     "sendit-client [--connect HOST:PORT] [--name NAME] [--password-env NAME | --password PASSWORD]
   --bots COUNT               Local Aim deathmatch opponents, 1..9 (default 5)
   --bot-skill NUMBER         Local bot difficulty, 0..1 (default 0.4)
-  --sensitivity NUMBER       Radians per raw mouse count (default 0.001)
+  --sensitivity NUMBER       Radians per unit of relative mouse movement (default 0.001)
   --width PX --height PX     Set window dimensions (benchmarks default to 1920 x 1080)
                              Local play opens maximized with a 1280 x 720 fallback
   --record FILE              Record live fixed-tick inputs

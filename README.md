@@ -41,7 +41,7 @@ In another terminal on the same machine, join with the following command. A seco
 target/release/sendit-client --connect 127.0.0.1:27015 --name Pilot
 ```
 
-Click to capture the mouse. Use WASD to move, Space to jump, the left mouse button to fire, and R to reload. F5 resets the practice drill, F3 shows authoritative shot diagnostics, F1 shows controls, and Esc releases the cursor. Mouse sensitivity is radians per raw device count (`--sensitivity 0.001` by default).
+Click to capture the mouse. Use WASD to move, Space to jump, the left mouse button to fire, and R to reload. F5 resets the practice drill, F3 shows authoritative shot diagnostics, F1 shows controls, and Esc releases the cursor. Mouse sensitivity defaults to 0.001 radians per unit of relative motion (`--sensitivity 0.001`). On macOS these deltas come from AppKit and can reflect the system’s pointer settings.
 
 ## Repeat a peek or a match
 

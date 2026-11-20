@@ -24,8 +24,11 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
       CARGO_BUILD_JOBS: '3'
+      RUST_CACHE_PATHS: |
+        ~/.cargo/registry
+        target
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - name: Check the native toolchain
@@ -33,20 +36,15 @@ jobs:
           test "$(uname -m)" = arm64
           rustc -vV
           xcrun --sdk macosx --show-sdk-version
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - id: rust-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
+          path: ${{ env.RUST_CACHE_PATHS }}
           key: macos-15-arm64-release-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Build and sign Sendit.app
+        id: package
         run: python3 scripts/package_release.py --platform macos --target aarch64-apple-darwin --out dist
-      - name: Test on Apple Silicon
-        run: cargo test --release --locked --workspace --target aarch64-apple-darwin
-      - name: Playtest the extracted download
-        run: python3 scripts/smoke-macos.py dist/sendit-macos-arm64.zip
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: sendit-macos-arm64
           path: |
@@ -54,3 +52,14 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
           compression-level: 0
+      - name: Cache compiled dependencies
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.RUST_CACHE_PATHS }}
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - name: Test on Apple Silicon
+        run: cargo test --release --locked --workspace --target aarch64-apple-darwin
+      - name: Playtest the extracted download
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        run: python3 scripts/smoke-macos.py dist/sendit-macos-arm64.zip

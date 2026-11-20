@@ -803,11 +803,30 @@ mod tests {
         socket
     }
 
+    #[track_caller]
     fn request(host: &mut Host, client: &UdpSocket, packet: ClientMsg) {
-        client
-            .send_to(&encode(&packet).unwrap(), host.address().unwrap())
-            .unwrap();
-        host.step(Instant::now()).unwrap();
+        let bytes = encode(&packet).unwrap();
+        // Each test sends one request at a time. Count its arrival even when the
+        // protocol intentionally gives no reply, such as a wrong-session Leave.
+        let expected = host.traffic.received + bytes.len() as u64;
+        client.send_to(&bytes, host.address().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut clock = crate::clock::TickClock::new();
+        loop {
+            host.step(Instant::now()).unwrap();
+            if host.traffic.received == expected {
+                return;
+            }
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "host did not receive {packet:?} before the deadline"
+            );
+            clock.finish(now);
+            if let Some(delay) = clock.delay() {
+                std::thread::sleep(delay.min(deadline - now));
+            }
+        }
     }
 
     fn receive(client: &UdpSocket) -> ServerMsg {
