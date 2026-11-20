@@ -6,6 +6,7 @@ Sendit is an original Rust first-person game. Jump into a free-for-all against b
 
 | Download | Launch after extracting |
 | --- | --- |
+| [macOS Apple Silicon (.zip)](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-macos-arm64.zip) | Double-click `Sendit.app`. You can also drag it to Applications. |
 | [Windows x86-64 (.zip)](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-windows-x86_64.zip) | Open the extracted folder and double-click `sendit-client.exe`. |
 | [Linux x86-64 (.tar.xz)](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-linux-x86_64.tar.xz) | Open a terminal in the extracted folder and run `./sendit-client`. |
 
@@ -13,13 +14,15 @@ Click the game window to start on Aim with **five bots at 40% skill**. Before st
 
 Move with **WASD**, look with the mouse, **left-click** to fire, **R** to reload and **Space** to jump. Every orange player is a rival. Hold **Tab** for the leaderboard. After a death, you return automatically in one second. **Esc** releases the mouse.
 
-To start with different settings, run `./sendit-client --bots 3 --bot-skill 0.2` on Linux or `.\sendit-client.exe --bots 3 --bot-skill 0.2` in PowerShell. [Download checksums](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS)
+The Mac build requires Apple Silicon and macOS 11 or later. It uses an ad-hoc signature. If macOS asks you to verify the developer, compare `shasum -a 256 ~/Downloads/sendit-macos-arm64.zip` with the published checksum. After attempting to open Sendit, you can approve this app under **System Settings → Privacy & Security → Open Anyway**. On macOS 11–12, use **System Preferences → Security & Privacy → General**. [Download checksums](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS) · [Apple’s first-open instructions](https://support.apple.com/guide/mac-help/mh40616/mac)
+
+To start with different settings, run `open -n /Applications/Sendit.app --args --bots 3 --bot-skill 0.2` on Mac, `./sendit-client --bots 3 --bot-skill 0.2` on Linux or `.\sendit-client.exe --bots 3 --bot-skill 0.2` in PowerShell.
 
 ![First-person view of a bot deathmatch on the Aim court](docs/images/aim-deathmatch.png)
 
 ## Build from source or host a drill
 
-Install Rust with rustup. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev`). The Linux client uses X11 or XWayland and a Vulkan-capable graphics driver. Headphones or speakers provide positional sound cues. The dedicated server runs without a window or audio device.
+Install Rust with rustup. On an Apple Silicon Mac, install the Xcode Command Line Tools with `xcode-select --install`. The native game uses Metal and CoreAudio. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev`). The Linux client uses X11 or XWayland and a Vulkan-capable graphics driver. Headphones or speakers provide positional sound cues. The dedicated server runs without a window or audio device.
 
 ```sh
 cargo build --release --locked --workspace
