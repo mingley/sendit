@@ -1,5 +1,6 @@
 /target/
 /results/
 /local-maps/
+__pycache__/
 *.jsonl
 !fixtures/*.jsonl

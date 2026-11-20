@@ -1,31 +1,34 @@
 # Sendit
 
-Sendit is an original Rust tactical first-person game for community-hosted matches. A native Bevy client and a headless dedicated server share a 128 Hz movement and rifle simulation. Play a two-player practice drill, a 5v5 bomb match, or continuous deathmatch over direct UDP. The release includes client prediction, input replay, occupied-match benchmarks, and a surf course.
+Sendit is an original Rust first-person game. Jump into a free-for-all against bots, host a 5v5 bomb match for friends, run a two-player practice drill, or ride a surf course. Local and hosted games use the same 128 Hz simulation.
 
-The provisional client target is 240 FPS at 1920×1080 on a Ryzen 5 7600, GeForce RTX 4060 8 GB, and 32 GB of DDR5. The server target is ten occupied slots with a p99 tick below 7.8125 ms. Targets require measured results for the specified workload.
+## Play bot deathmatch
 
-![Competitive buy phase on Relay with the two-team scoreboard open](docs/images/relay.png)
+| Download | Launch after extracting |
+| --- | --- |
+| [Windows x86-64 (.zip)](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-windows-x86_64.zip) | Open the extracted folder and double-click `sendit-client.exe`. |
+| [Linux x86-64 (.tar.xz)](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-linux-x86_64.tar.xz) | Open a terminal in the extracted folder and run `./sendit-client`. |
 
-## Play the Linux build
+Click the game window to start on Aim with **five bots at 40% skill**. Before starting, press **Left / Right** to choose 1–9 bots or **Down / Up** to change their skill. The game creates a private match on your machine and works offline.
 
-[Download the x86-64 Linux build](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-linux-x86_64.tar.xz) · [SHA-256 checksum](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS)
+Move with **WASD**, look with the mouse, **left-click** to fire, **R** to reload and **Space** to jump. Every orange player is a rival. Hold **Tab** for the leaderboard. After a death, you return automatically in one second. **Esc** releases the mouse.
 
-Extract the archive and start a populated match. These binaries were built and tested on Debian 13. The headless server runs as one executable with the four stock maps embedded.
+To start with different settings, run `./sendit-client --bots 3 --bot-skill 0.2` on Linux or `.\sendit-client.exe --bots 3 --bot-skill 0.2` in PowerShell. [Download checksums](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS)
 
-```sh
-tar -xJf sendit-linux-x86_64.tar.xz
-cd sendit-linux-x86_64
-./sendit-server --mode deathmatch --map aim --fill 10
-```
+![First-person view of a bot deathmatch on the Aim court](docs/images/aim-deathmatch.png)
 
-In another terminal in the extracted directory, run `./sendit-client --connect 127.0.0.1:27015`. For a LAN game, use the host's IP address. The examples below use source-build paths. With the download, replace `target/release/` with `./` and pass `--bin-dir .` to the Python benchmark wrapper.
+## Build from source or host a drill
 
-## Build and join a drill
-
-Install Rust with rustup. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev`). To run the desktop game, use an X11 or XWayland display, a Vulkan-capable graphics driver, and an audio output for positional cues. The dedicated server runs without a window or audio device.
+Install Rust with rustup. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev`). The Linux client uses X11 or XWayland and a Vulkan-capable graphics driver. Headphones or speakers provide positional sound cues. The dedicated server runs without a window or audio device.
 
 ```sh
 cargo build --release --locked --workspace
+target/release/sendit-client
+```
+
+For a multiplayer drill, start the dedicated server. The commands below use source-build paths. With the download, run the executables in the extracted folder and pass `--bin-dir .` to the Python benchmark wrapper.
+
+```sh
 target/release/sendit-server --bind 0.0.0.0:27015 --map drill --mode practice
 ```
 
@@ -63,7 +66,7 @@ target/release/sendit-probe verify-rules --server target/release/sendit-server
 
 Start one host per port. Competitive balances Terrorists and Counter-Terrorists with up to five players on each side. Relay has two marked sites, outer lanes and a central connector. The round starts when both teams have a player. Buy for 10 seconds, then attack or defend for 105 seconds. The carrier holds E while stationary on a site for 3 seconds to plant. G drops the pack and E recovers it. Defenders have 35 seconds after planting to complete a 5-second defuse, including when the last attacker has died.
 
-Each player has one life per live round. Use Tab for scores and to cycle living teammates while spectating. Both sides start with a 12-round rifle and $1,200. B buys the 30-round kit with 50 armor for $1,200 during buy time. The server awards money for outcomes, kills, and objective work. Survivors can carry their kit forward. Players who join a live round spectate until the next buy phase. Squads swap sides after 12 rounds. First to 13 wins, and 12–12 is a draw.
+Each player has one life per live round. Use Tab for scores and to cycle living teammates while spectating. Both sides start with a 12-round rifle and $1,200. B buys the 30-round kit with 50 armor for $1,200 during buy time. The server awards money for outcomes, kills, and objective work. Survivors can carry their kit forward. Players who join a live round spectate until the next buy phase. Squads swap sides after 12 rounds. First to 13 wins, and 12–12 is a draw. [Relay scoreboard](docs/images/relay.png)
 
 Deathmatch continually respawns players. Select `--loadout light`, `standard`, or `armored` at startup. On a map without bomb sites, competitive uses elimination and the round clock, so the same geometry can host other rulesets.
 
@@ -109,4 +112,4 @@ Aim can host a deathmatch or a round-based duel. Surf has a marked start, connec
 
 For custom maps, install a JSON file on the server and start it by name. The client downloads and validates the geometry on join and map change. [Map format and installation](docs/maps.md)
 
-The benchmark guide includes workload definitions, hardware, measurements and reproduction commands. [Performance measurements](docs/performance.md)
+The provisional target is 240 FPS at 1920×1080 on a Ryzen 5 7600, GeForce RTX 4060 8 GB and 32 GB of DDR5. The server target is ten occupied slots with a p99 tick below 7.8125 ms. The benchmark guide includes the tested hardware, measured workloads and reproduction commands. [Performance measurements](docs/performance.md)
