@@ -12,7 +12,7 @@ Sendit is an original Rust first-person game. Jump into a free-for-all against b
 
 Click the game window to start on Aim with **five bots at 40% skill**. Before starting, press **Left / Right** to choose 1–9 bots or **Down / Up** to change their skill. The game creates a private match on your machine and works offline.
 
-Move with **WASD**, aim with the mouse, **left-click** to attack, **R** to reload and **Space** to jump. Every orange player is a rival. Hold **Tab** for the leaderboard. After a death, you return in one second with your selected weapon. Press **Esc** at any time to reach **Resume** and **Quit to Desktop**. You can click either button or use the arrow keys and **Enter**.
+Move with **WASD**, aim with the mouse, **left-click** to attack, **R** to reload and **Space** to jump. Every orange player is a rival. Hold **Tab** for the leaderboard. After a death, you return in one second with your selected weapon. Press **Esc** during a match for **Resume** and **Quit to desktop**. Click either button or use the arrow keys and **Enter**.
 
 | Key | Deathmatch weapon | How it plays |
 | --- | --- | --- |
@@ -23,17 +23,17 @@ Move with **WASD**, aim with the mouse, **left-click** to attack, **R** to reloa
 | **5** | .50 sniper | Hold the right mouse button to use the scope. Click once per shot. |
 | **6** | SMG | Fast automatic fire and a 36-round magazine. |
 
-Your equipped weapon kicks as it fires. A cross at the reticle confirms a server-registered hit. Incoming damage flashes red on the side the hit came from. Nearby fire has a separate amber indicator. In stereo, your own shots and steps are centered. Other players’ sounds change side as you turn and become quieter and more muffled with distance and cover.
+Your equipped weapon kicks as it fires. A cross at the reticle confirms a server-registered hit. Incoming damage flashes red on the side the hit came from. Nearby fire has a separate amber indicator. In stereo, your own shots and steps are centered. Other players’ sounds change side as you turn and become quieter and more muffled with distance and cover. Footsteps on stone, wood and metal each have a different sound.
 
 The Mac build requires Apple Silicon and macOS 11 or later. It uses an ad-hoc signature. If macOS asks you to verify the developer, compare `shasum -a 256 ~/Downloads/sendit-macos-arm64.zip` with the published checksum. After attempting to open Sendit, you can approve this app under **System Settings → Privacy & Security → Open Anyway**. On macOS 11–12, use **System Preferences → Security & Privacy → General**. [Download checksums](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS) · [Apple’s first-open instructions](https://support.apple.com/guide/mac-help/mh40616/mac)
 
 To start with different settings, run `open -n /Applications/Sendit.app --args --bots 3 --bot-skill 0.2` on Mac, `./sendit-client --bots 3 --bot-skill 0.2` on Linux or `.\sendit-client.exe --bots 3 --bot-skill 0.2` in PowerShell.
 
-![First-person view of a bot deathmatch on the Aim court](docs/images/aim-deathmatch.png)
+![A player scores a first kill with the M4 in a five-bot deathmatch on Aim](docs/images/aim-deathmatch.png)
 
 ## Build from source or host a drill
 
-Install Rust with rustup. On an Apple Silicon Mac, install the Xcode Command Line Tools with `xcode-select --install`. The native game uses Metal and CoreAudio. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev`). The Linux client uses X11 or XWayland and a Vulkan-capable graphics driver. Headphones or speakers provide positional sound cues. The dedicated server runs without a window or audio device.
+Install Rust with rustup. On an Apple Silicon Mac, install the Xcode Command Line Tools with `xcode-select --install`. The native game uses Metal and CoreAudio. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev libxkbcommon-x11-0`). The Linux client uses X11 or XWayland and a Vulkan-capable graphics driver. Headphones or speakers provide positional sound cues. The dedicated server runs without a window or audio device.
 
 ```sh
 cargo build --release --locked --workspace
@@ -69,7 +69,7 @@ python3 scripts/benchmark.py client --players 10 --seconds 30 --width 1920 --hei
 
 The UDP verifier starts two fresh servers and drives two clients per run, once locally and once with delay, jitter, and loss. The peek fixture records two actors' input tracks with the same approach to the corner, then measures distance and elapsed ticks until each actor can fire a settled first shot. `Tuning::default()` in `crates/sim/src/motion.rs` sets friction, acceleration, movement spread and recovery. `crates/sim/src/rifle.rs` holds the fixed angular recoil pattern. To try the new friction live, start the host with `--friction 8`. Connected clients receive the server's tuning.
 
-The desktop playtest drives the release game with mouse and keyboard events on a private Linux X11 display. Install `xvfb x11-utils libxtst6 tesseract-ocr-eng mesa-vulkan-drivers python3-pil python3-numpy` and run the following after building. The output directory holds screenshots, game logs and the playtest report. The separate `verify-arsenal` command uses two network clients to check weapon selection, damage direction, range, reloads and respawns against the live server.
+The desktop playtest drives the release game with mouse and keyboard events on a private Linux X11 display. Install `xvfb x11-utils libxtst6 libxkbcommon-x11-0 tesseract-ocr-eng mesa-vulkan-drivers python3-pil python3-numpy` and run the following after building. The output directory holds screenshots, game logs and the playtest report. The separate `verify-arsenal` command uses two network clients to check weapon selection, damage direction, range, reloads and respawns against the live server.
 
 ```sh
 python3 scripts/playtest-desktop.py --bin-dir target/release --output-dir /tmp/sendit-playtest

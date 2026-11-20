@@ -221,6 +221,73 @@ struct Yard {
     batches: [Batch; COUNT],
 }
 
+const AIM_DRAIN_X: f32 = 12.65;
+const AIM_DRAIN_HALF_WIDTH: f32 = 0.12;
+const AIM_DRAIN_END: f32 = 12.8;
+
+pub(crate) fn iron_grate(map: &str, feet: Vec3) -> bool {
+    map == "aim"
+        && feet.y.abs() < 0.06
+        && (feet.x.abs() - AIM_DRAIN_X).abs() <= AIM_DRAIN_HALF_WIDTH
+        && feet.z.abs() <= AIM_DRAIN_END
+}
+
+fn box_surfaces(map: &str, b: &Solid) -> (Surface, Surface) {
+    let size = b.max - b.min;
+    match b.material {
+        Material::Floor => (Slate, Pavers),
+        Material::Wall => {
+            let s = if map == "aim" && b.min.z > 12. {
+                Brick
+            } else {
+                Stone
+            };
+            (s, PaleStone)
+        }
+        Material::Cover if map == "aim" && b.min.y > 1.0 && size.z < 0.28 => (Soot, Iron),
+        Material::Cover if size.y < 1.4 && size.x.min(size.z) > 0.65 => (LowFreight, Deck),
+        Material::Cover if size.x.min(size.z) > 0.65 && size.y < 2.7 * size.x.min(size.z) => {
+            (Cargo, Deck)
+        }
+        Material::Cover => (Iron, Iron),
+        Material::Trim if map == "aim" && size.y < 0.22 => (Deck, Deck),
+        Material::Trim => (Hazard, Hazard),
+        Material::Ramp => (Iron, Iron),
+        Material::Step => (Slate, Slate),
+        Material::Target => (Target, Target),
+        Material::SiteA if b.min.y >= 0. => (OchreMark, OchreMark),
+        Material::SiteB if b.min.y >= 0. => (BlueMark, BlueMark),
+        Material::SiteA => (SiteA, SiteA),
+        Material::SiteB => (SiteB, SiteB),
+    }
+}
+
+fn ramp_surface(material: Material) -> Surface {
+    match material {
+        Material::SiteA => SiteA,
+        Material::SiteB => SiteB,
+        Material::Trim => Hazard,
+        _ => Iron,
+    }
+}
+
+pub(crate) fn ramp_footing(material: Material) -> crate::audio::Footing {
+    footing(ramp_surface(material))
+}
+
+pub(crate) fn box_footing(map: &str, b: &Solid) -> crate::audio::Footing {
+    footing(box_surfaces(map, b).1)
+}
+
+fn footing(top: Surface) -> crate::audio::Footing {
+    use crate::audio::Footing;
+    match top {
+        Deck | Cargo | LowFreight => Footing::Wood,
+        Iron | Soot | Shutter | Hazard | Target | OchreMark | BlueMark | Drain => Footing::Metal,
+        _ => Footing::Stone,
+    }
+}
+
 fn projected(p: Vec3, n: Vec3, surface: Surface) -> Vec2 {
     let scale = match surface {
         Stone | PaleStone => 3.4,
@@ -370,37 +437,7 @@ impl Yard {
     }
     fn collision_mesh(&mut self, arena: &Arena) {
         for b in &arena.boxes {
-            let size = b.max - b.min;
-            let (side, top) = match b.material {
-                Material::Floor => (Slate, Pavers),
-                Material::Wall => {
-                    let s = if arena.name == "aim" && b.min.z > 12. {
-                        Brick
-                    } else {
-                        Stone
-                    };
-                    (s, PaleStone)
-                }
-                Material::Cover if arena.name == "aim" && b.min.y > 1.0 && size.z < 0.28 => {
-                    (Soot, Iron)
-                }
-                Material::Cover if size.y < 1.4 && size.x.min(size.z) > 0.65 => (LowFreight, Deck),
-                Material::Cover
-                    if size.x.min(size.z) > 0.65 && size.y < 2.7 * size.x.min(size.z) =>
-                {
-                    (Cargo, Deck)
-                }
-                Material::Cover => (Iron, Iron),
-                Material::Trim if arena.name == "aim" && size.y < 0.22 => (Deck, Deck),
-                Material::Trim => (Hazard, Hazard),
-                Material::Ramp => (Iron, Iron),
-                Material::Step => (Slate, Slate),
-                Material::Target => (Target, Target),
-                Material::SiteA if b.min.y >= 0. => (OchreMark, OchreMark),
-                Material::SiteB if b.min.y >= 0. => (BlueMark, BlueMark),
-                Material::SiteA => (SiteA, SiteA),
-                Material::SiteB => (SiteB, SiteB),
-            };
+            let (side, top) = box_surfaces(&arena.name, b);
             let base = corners(b.min, b.max);
             // Only the few authored ground slabs need baked vertex lighting; arbitrary maps
             // retain constant construction costs per brush.
@@ -418,12 +455,7 @@ impl Yard {
         }
         for r in &arena.ramps {
             let base = corners(r.min, r.max);
-            let surface = match r.material {
-                Material::SiteA => SiteA,
-                Material::SiteB => SiteB,
-                Material::Trim => Hazard,
-                _ => Iron,
-            };
+            let surface = ramp_surface(r.material);
             self.shell(
                 Slate,
                 surface,
@@ -739,11 +771,11 @@ impl Yard {
                     [x.max(x - sign * 0.14), 4.96, z + 0.40],
                 );
             }
-            let drain = sign * 12.65;
+            let drain = sign * AIM_DRAIN_X;
             self.floor_label(
                 Drain,
-                [drain - 0.12, drain + 0.12],
-                [-12.8, 12.8],
+                [drain - AIM_DRAIN_HALF_WIDTH, drain + AIM_DRAIN_HALF_WIDTH],
+                [-AIM_DRAIN_END, AIM_DRAIN_END],
                 Vec2::new(8., 0.50),
             );
             for interval in [-9., -6., -3., 0., 3., 6., 9.] {

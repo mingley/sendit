@@ -1,4 +1,4 @@
-use super::Cue;
+use super::{Cue, Footing};
 use sendit_sim::Weapon;
 use std::f32::consts::{PI, TAU};
 
@@ -80,7 +80,7 @@ pub(super) fn synthesize(cue: Cue, color: Coloration) -> Vec<u8> {
                 click * (decay(81.) + transient(0.163 + 0.009 * weapon.index() as f32, 68.))
                     + 0.31 * body_noise * transient(0.062, 20.)
             }
-            Cue::Step(alternate) => {
+            Cue::Step(Footing::Stone, alternate) => {
                 let (pitch, scuff) = if alternate {
                     (87., 0.039)
                 } else {
@@ -89,6 +89,23 @@ pub(super) fn synthesize(cue: Cue, color: Coloration) -> Vec<u8> {
                 0.55 * tone(pitch) * decay(37.)
                     + 0.61 * body_noise * decay(30.)
                     + 0.31 * white * transient(scuff, 125.)
+            }
+            Cue::Step(Footing::Wood, alternate) => {
+                let pitch = if alternate { 124. } else { 140. };
+                // Hollow board resonance and a second, quieter toe knock.
+                let knock = 0.43 * tone(pitch) + 0.24 * tone(pitch * 1.83);
+                knock * (decay(34.) + 0.39 * transient(0.035, 62.))
+                    + 0.42 * body_noise * decay(45.)
+                    + 0.13 * white * decay(110.)
+            }
+            Cue::Step(Footing::Metal, alternate) => {
+                let pitch = if alternate { 460. } else { 504. };
+                // The short low sole impact excites two inharmonic plate modes.
+                0.23 * tone(96.) * decay(41.)
+                    + 0.32 * white * decay(85.)
+                    + 0.29 * tone(pitch) * decay(21.)
+                    + 0.15 * tone(pitch * 2.38) * decay(28.)
+                    + 0.15 * body_noise * transient(0.029, 60.)
             }
             Cue::Pass => {
                 (0.43 * (TAU * (1710. * t - 4900. * t * t)).sin() + 0.38 * white)

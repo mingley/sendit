@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Verify the extracted Apple Silicon game, its Metal renderer and its foreground controls."""
 import argparse
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import re
+import select
 import shutil
 import subprocess
 import tempfile
@@ -22,17 +24,27 @@ def wait_for(client, description, check, timeout=15):
     raise RuntimeError(f"Timed out waiting for {description}")
 
 
-def recorded_controls(path):
+def read_trace(path):
     if not path.exists():
-        return None
+        return [], []
     # The recorder can be writing its final line as we read.
     lines = path.read_bytes().split(b"\n")[:-1]
     if not lines:
-        return None
+        return [], []
     rows = [json.loads(line) for line in lines]
     header = rows[0]
     if (header["source"], header["map"], header["mode"]) != ("human-client", "aim", "Deathmatch"):
         raise RuntimeError(f"Unexpected input recording header: {header}")
+    return lines, rows
+
+
+def observed_tick(path, after, condition):
+    _, rows = read_trace(path)
+    return next((r["tick"] for r in rows if "input" in r and r["tick"] > after and condition(r["input"])), None)
+
+
+def recorded_controls(path):
+    lines, rows = read_trace(path)
     samples = [r for r in rows if "input" in r]
     equip = next((r["tick"] for r in samples if r["input"].get("equip") == "smg"), None)
     if equip is None:
@@ -41,13 +53,31 @@ def recorded_controls(path):
     if not forward:
         return None
     fire = [r["tick"] for r in samples if r["tick"] > forward[-1] and r["input"]["fire"]]
-    if not fire:
+    if not fire or samples[-1]["tick"] == fire[-1]:
         return None
     # End exactly at the observed burst. A later bot kill and respawn can refill the magazine.
     prefix = [line for line, row in zip(lines, rows) if row.get("tick", 0) <= fire[-1]]
     return b"\n".join(prefix) + b"\n", {
         "equip_tick": equip, "forward_samples": len(forward), "fire_samples": len(fire),
     }
+
+
+@contextmanager
+def hold(driver, action, pid):
+    process = subprocess.Popen([driver, action, str(pid)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        if not select.select([process.stdout], [], [], 12)[0] or process.stdout.readline() != b"held\n":
+            raise RuntimeError(f"Could not post the foreground {action} event")
+        yield
+    finally:
+        try:
+            process.communicate(input=b"release\n", timeout=4)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        if process.returncode:
+            raise RuntimeError(f"The native {action} control exited with code {process.returncode}")
 
 
 def play_with_os_input(app, bench, driver, work):
@@ -71,8 +101,31 @@ def play_with_os_input(app, bench, driver, work):
         wait_for(client, "the rendered lobby", lambda: log_matches(r"QUICKPLAY_READY map=aim bots=1 "), 70)
         gesture("start")
         wait_for(client, "the local player and one bot", lambda: log_matches(r"QUICKPLAY_PLAYING id=\d+ players=2\b"))
-        gesture("play")
-        prefix, receipt = wait_for(client, "recorded SMG, movement and fire inputs", lambda: recorded_controls(trace))
+        def observed(description, after, condition):
+            return wait_for(client, description, lambda: observed_tick(trace, after, condition))
+
+        observed("the live input stream", -1, lambda _: True)
+        gesture("equip")
+        equip_tick = observed("a recorded SMG selection", -1, lambda cmd: cmd.get("equip") == "smg")
+        with hold(driver, "walk", client.pid):
+            walked = observed("recorded forward movement while holding W", equip_tick, lambda cmd: cmd["forward"] > 0.5)
+        stopped = observed("the W release", walked, lambda cmd: cmd["forward"] == 0)
+        with hold(driver, "fire", client.pid):
+            fired = observed("recorded fire while holding the mouse", stopped, lambda cmd: cmd["fire"])
+            observed("a sustained firing burst", fired + 12, lambda cmd: cmd["fire"])
+        prefix, receipt = wait_for(client, "the recorded fire release", lambda: recorded_controls(trace))
+        gesture("pause")
+        # The in-game menu suppresses D while the host and the recorder keep ticking.
+        # Two recorder flushes ensure the sample interval follows the actual key-down.
+        with hold(driver, "strafe", client.pid):
+            _, rows = read_trace(trace)
+            latest = max(r["tick"] for r in rows if "input" in r)
+            end = observed("the open menu across 256 input ticks", latest + 255, lambda _: True)
+            _, rows = read_trace(trace)
+            paused = [r["input"] for r in rows if "input" in r and latest + 128 < r["tick"] <= end]
+            if not paused or any(cmd["strafe"] for cmd in paused):
+                raise RuntimeError("The live player moved while Escape was open and D was held")
+            receipt["paused_samples"] = len(paused)
         gesture("quit")
         if client.wait(timeout=12) != 0:
             raise RuntimeError(f"The menu quit with exit code {client.returncode}")
@@ -120,9 +173,10 @@ def smoke(archive, scratch, results):
     capabilities = json.loads(subprocess.check_output([driver, "status"], timeout=15))
     results["capabilities"] = capabilities
     metal = capabilities["metal"]
-    if not metal:
+    if not metal or not capabilities["login_session"]:
+        reason = "No Metal device" if not metal else "No macOS login session for a window"
         for check in ["metal_match", "os_input"]:
-            results[check] = {"status": "skipped", "reason": "No Metal device"}
+            results[check] = {"status": "skipped", "reason": reason}
         return
     report = work / "match.json"
     subprocess.run([
@@ -139,9 +193,7 @@ def smoke(archive, scratch, results):
     print(f"Sendit.app rendered Aim with five bots on {metal} "
           f"({match['frame_interval_ms']['samples']} frame intervals).", flush=True)
     results["metal_match"] = {"status": "passed", "players": 6, "frame_intervals": match["frame_interval_ms"]["samples"]}
-    if not capabilities["login_session"]:
-        results["os_input"] = {"status": "skipped", "reason": "No macOS login session"}
-    elif not capabilities["post_events"]:
+    if not capabilities["post_events"]:
         results["os_input"] = {"status": "skipped", "reason": "macOS denied Quartz event posting (Accessibility)"}
     else:
         results["os_input"] = {"status": "failed"}

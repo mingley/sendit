@@ -577,7 +577,7 @@ impl Session {
                 );
             }
             if player.hp > 0 && old.hp > 0 && player.body.grounded && old.body.grounded {
-                audio.walk(player.id, player.body.pos, old.body.pos);
+                audio.walk(player.id, player.body.pos, old.body.pos, &self.map);
             }
         }
         if self
@@ -1219,7 +1219,7 @@ pub fn predict(
         if s.body.grounded && before.grounded {
             s.walk_distance = (s.walk_distance + (s.body.pos - before.pos).with_y(0.).length())
                 % sendit_sim::bots::STEP_STRIDE;
-            audio.walk(id, s.body.pos, before.pos);
+            audio.walk(id, s.body.pos, before.pos, &s.map);
         }
         s.tap_fire = false;
         s.input.fire = s.fire_held;

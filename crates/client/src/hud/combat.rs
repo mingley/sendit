@@ -278,12 +278,18 @@ pub fn update(
         Without<Layer>,
     >,
 ) {
+    let now = Instant::now();
+    let me = s.me();
+    let alive = me.is_some_and(|p| p.hp > 0);
+    let damage = intensity(s.damage_at, now, 0.65);
+    // The death camera holds the victim's final facing until spectating or respawn.
+    let last_hit = me.filter(|p| p.hp == 0 && s.spectate.is_none() && damage > 0.);
     let show = !menu.open
         && !s.local_lobby
         && !s.scoreboard
         && !s.show_help
-        && s.me().is_some_and(|p| p.hp > 0);
-    let scoped = show && s.scoped();
+        && (alive || last_hit.is_some());
+    let scoped = show && alive && s.scoped();
     for (layer, mut node) in &mut layers {
         let visible = match layer {
             Layer::Sights => show,
@@ -302,16 +308,14 @@ pub fn update(
         return;
     }
 
-    let now = Instant::now();
     let fired = intensity(s.local_shot_time, now, 0.21);
     let hit = intensity(s.confirmed_hit_at, now, 0.34);
-    let damage = intensity(s.damage_at, now, 0.65);
     let recent_fire = s
         .nearby_fire
         .filter(|(t, _)| intensity(Some(*t), now, 0.36) > 0.);
     let damage_dir = s
         .damage_origin
-        .and_then(|origin| bearing(s.body.pos, origin, s.input.yaw));
+        .and_then(|origin| bearing(s.body.pos, origin, last_hit.map_or(s.input.yaw, |p| p.yaw)));
     let nearby_dir = recent_fire.and_then(|(_, origin)| bearing(s.body.pos, origin, s.input.yaw));
     let motion = if s.mode == Mode::Surf {
         0.
@@ -321,7 +325,7 @@ pub fn update(
     let gap = 4.3 + 3.0 * motion + 9.0 * fired;
     for (mark, mut node, mut transform, mut color, mut visibility) in &mut marks {
         let stroke = match *mark {
-            Mark::Aim(dir) if !scoped => {
+            Mark::Aim(dir) if alive && !scoped => {
                 let color = if fired > 0.45 {
                     Color::srgb_u8(255, 245, 193)
                 } else {
@@ -350,7 +354,7 @@ pub fn update(
                     color: Color::srgba(1., 0.27, 0.16, (damage * 2.5).min(1.)),
                 }
             }),
-            Mark::Gunfire(side) if damage == 0. => nearby_dir.map(|dir| {
+            Mark::Gunfire(side) if alive && damage == 0. => nearby_dir.map(|dir| {
                 let tangent = Vec2::new(-dir.y, dir.x);
                 let center = dir * 85.;
                 Stroke {
@@ -440,6 +444,13 @@ mod tests {
         session.confirmed_hit_at = Some(Instant::now());
         app.update();
         assert!(visible(&app, damage) && visible(&app, hit) && !visible(&app, gunfire));
+
+        let mut session = app.world_mut().resource_mut::<Session>();
+        session.players[0].hp = 0;
+        session.players[0].yaw = FRAC_PI_2;
+        app.update();
+        assert!(visible(&app, damage) && !visible(&app, aim));
+        assert!(matches!(app.world().get::<Node>(damage).unwrap().top, Val::Px(y) if y < -60.));
     }
 
     #[test]

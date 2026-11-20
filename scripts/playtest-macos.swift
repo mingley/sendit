@@ -9,7 +9,10 @@ func fail(_ message: String) -> Never {
 }
 
 func wait(_ seconds: TimeInterval) {
-    RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
+    let deadline = Date(timeIntervalSinceNow: seconds)
+    RunLoop.current.run(until: deadline)
+    // A command-line run loop can return early when it has no live sources.
+    if deadline.timeIntervalSinceNow > 0 { Thread.sleep(until: deadline) }
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -60,11 +63,16 @@ while (!inFront() || gameBounds() == nil) && Date() < deadline {
 }
 guard inFront(), let bounds = gameBounds() else { fail("Could not focus the packaged game window") }
 
-func key(_ code: CGKeyCode, hold: TimeInterval = 0.16) {
+func keyEvents(_ code: CGKeyCode) -> (CGEvent, CGEvent) {
     guard inFront(),
           let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true),
           let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
     else { fail("Could not send a key to the foreground game") }
+    return (down, up)
+}
+
+func key(_ code: CGKeyCode, hold: TimeInterval = 0.16) {
+    let (down, up) = keyEvents(code)
     down.post(tap: .cghidEventTap)
     wait(hold)
     up.post(tap: .cghidEventTap)
@@ -88,20 +96,33 @@ func click(hold: TimeInterval) {
     mouse(.leftMouseUp)
 }
 
+// Keep the OS key or button down in this process until Python sees it in the game's recording.
+func awaitRelease() {
+    FileHandle.standardOutput.write(Data("held\n".utf8))
+    _ = readLine()
+}
+
 switch args[0] {
 case "start":
     click(hold: 0.16)
-case "play":
-    key(22)                 // ANSI number-row 6 selects the SMG.
-    key(13, hold: 0.36)    // W moves forward through the captured window.
-    click(hold: 0.52)
+case "equip":
+    key(22, hold: 0.22)    // ANSI number-row 6 selects the SMG.
+case "walk", "strafe":
+    let (down, up) = keyEvents(args[0] == "walk" ? 13 : 2) // ANSI W and D.
+    down.post(tap: .cghidEventTap)
+    awaitRelease()
+    up.post(tap: .cghidEventTap)
+case "fire":
+    mouse(.leftMouseDown)
+    awaitRelease()
+    mouse(.leftMouseUp)
+case "pause":
+    mouse(.mouseMoved)
+    key(53, hold: 0.26)    // Escape opens the in-game menu with Resume selected.
 case "quit":
-    mouse(.mouseMoved)
-    key(53)                // Escape opens the in-game menu with Resume selected.
-    mouse(.mouseMoved)
-    wait(0.22)
-    key(125)               // Down selects Quit to desktop.
-    key(36)                // Return confirms.
+    key(125, hold: 0.26)   // Down selects Quit to desktop.
+    wait(0.50)
+    key(36, hold: 0.26)    // Return confirms.
 default:
     fail("Unknown playtest action \(args[0])")
 }

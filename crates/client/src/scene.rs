@@ -1,6 +1,6 @@
 //! First-person presentation and interpolated world actors.
 mod effects;
-mod environment;
+pub(crate) mod environment;
 mod models;
 
 pub(crate) use effects::combat_effects;

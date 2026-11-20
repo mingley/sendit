@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 pub(crate) fn ink() -> Color {
     Color::srgba(0.085, 0.079, 0.058, 0.92)
 }
+pub(crate) fn panel() -> Color {
+    Color::srgb_u8(36, 34, 27)
+}
 pub(crate) fn ash() -> Color {
     Color::srgb_u8(222, 210, 184)
 }
@@ -100,7 +103,7 @@ fn spawn_local_lobby(commands: &mut Commands) {
                         ..default()
                     },
                     BorderColor(amber()),
-                    BackgroundColor(ink()),
+                    BackgroundColor(panel()),
                 ))
                 .with_children(|panel| {
                     panel.spawn(text("Play bot deathmatch", 29., Color::WHITE));
@@ -245,14 +248,16 @@ pub fn setup(
 
     combat::spawn(&mut commands, &mut images);
     arsenal::spawn(&mut commands);
-    for (top, kind, size, color) in [
-        (57., Field::Action, 16., amber()),
-        (63., Field::Status, 20., Color::WHITE),
+    // Keep notices below the directional marks at every supported UI scale.
+    for (offset, kind, size, color) in [
+        (103., Field::Action, 16., amber()),
+        (138., Field::Status, 20., Color::WHITE),
     ] {
         commands
             .spawn(Node {
                 position_type: PositionType::Absolute,
-                top: Val::Percent(top),
+                top: Val::Percent(50.),
+                margin: UiRect::top(Val::Px(offset)),
                 width: Val::Percent(100.),
                 justify_content: JustifyContent::Center,
                 ..default()

@@ -22,10 +22,51 @@ mod synth;
 use synth::{synthesize, Coloration};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Footing {
+    Stone,
+    Wood,
+    Metal,
+}
+
+impl Footing {
+    /// Sample the collider supporting the character's feet only when its next stride lands.
+    fn at(arena: &sendit_sim::Arena, feet: Vec3) -> Self {
+        use crate::scene::environment::{box_footing, iron_grate, ramp_footing};
+        use sendit_sim::motion::RADIUS;
+        let over = |min: Vec3, max: Vec3, margin: f32| {
+            feet.x >= min.x - margin
+                && feet.x <= max.x + margin
+                && feet.z >= min.z - margin
+                && feet.z <= max.z + margin
+        };
+        let boxes = arena.boxes.iter().filter_map(|b| {
+            let gap = (b.max.y - feet.y).abs();
+            (gap <= 0.025 && over(b.min, b.max, RADIUS - 0.0001))
+                .then(|| (gap, !over(b.min, b.max, 0.), box_footing(&arena.name, b)))
+        });
+        // The movement controller samples wedge height at the center of the body.
+        let ramps = arena.ramps.iter().filter_map(|r| {
+            let gap = (r.height_at(feet.x, feet.z) - feet.y).abs();
+            (gap <= 0.025 && over(r.min, r.max, 0.0001))
+                .then(|| (gap, false, ramp_footing(r.material)))
+        });
+        let contact = boxes
+            .chain(ramps)
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+            .map(|(_, _, material)| material);
+        if contact == Some(Self::Stone) && iron_grate(&arena.name, feet) {
+            Self::Metal
+        } else {
+            contact.unwrap_or(Self::Stone)
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Cue {
     Shot(Weapon),
     Reload(Weapon),
-    Step(bool),
+    Step(Footing, bool),
     Pass,
     Damage,
     Objective,
@@ -38,8 +79,6 @@ pub enum Cue {
 impl Cue {
     fn all() -> impl Iterator<Item = Self> {
         [
-            Self::Step(false),
-            Self::Step(true),
             Self::Pass,
             Self::Damage,
             Self::Objective,
@@ -49,6 +88,11 @@ impl Cue {
             Self::Detonated,
         ]
         .into_iter()
+        .chain(
+            [Footing::Stone, Footing::Wood, Footing::Metal]
+                .into_iter()
+                .flat_map(|underfoot| [Self::Step(underfoot, false), Self::Step(underfoot, true)]),
+        )
         .chain(Weapon::ALL.into_iter().map(Self::Shot))
         .chain(
             Weapon::ALL
@@ -67,7 +111,8 @@ impl Cue {
             Self::Shot(Weapon::Sniper) => 0.55,
             Self::Shot(Weapon::Smg) => 0.12,
             Self::Reload(_) => 0.30,
-            Self::Step(_) | Self::Pass => 0.13,
+            Self::Step(Footing::Metal, _) => 0.19,
+            Self::Step(_, _) | Self::Pass => 0.13,
             Self::Damage => 0.16,
             Self::Objective => 0.15,
             Self::Use => 0.13,
@@ -85,7 +130,7 @@ impl Cue {
             Self::Shot(Weapon::Smg) => (0.51, 10., SHOT_HEARING_RANGE),
             Self::Shot(_) => (0.60, 13., SHOT_HEARING_RANGE),
             Self::Reload(_) => (0.36, 4., 13.),
-            Self::Step(_) => (0.50, 6., STEP_HEARING_RANGE),
+            Self::Step(_, _) => (0.50, 6., STEP_HEARING_RANGE),
             Self::Pass => (0.45, 1.5, 3.),
             Self::Damage => (0.48, 1., 1.),
             Self::Objective => (0.45, 11., 45.),
@@ -191,7 +236,7 @@ impl Sound {
         self.last_use = None;
     }
 
-    pub fn walk(&mut self, id: u16, pos: Vec3, previous: Vec3) {
+    pub fn walk(&mut self, id: u16, pos: Vec3, previous: Vec3, arena: &sendit_sim::Arena) {
         if !self.enabled {
             return;
         }
@@ -205,7 +250,7 @@ impl Sound {
         if *stride >= STEP_STRIDE {
             *stride %= STEP_STRIDE;
             *alternate = !*alternate;
-            let cue = Cue::Step(*alternate);
+            let cue = Cue::Step(Footing::at(arena, pos), *alternate);
             self.emit_actor(cue, pos + Vec3::Y * 0.15, id);
         }
     }
@@ -307,7 +352,7 @@ fn mix(
     let (mut gain, radius, cutoff) = event.cue.mix();
     let spatial = event.spatial && (event.owner.is_none() || event.owner != subject);
     if !spatial {
-        if matches!(event.cue, Cue::Step(_)) {
+        if matches!(event.cue, Cue::Step(_, _)) {
             gain *= 0.68;
         }
         return Some(Mix {

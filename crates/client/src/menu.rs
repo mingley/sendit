@@ -82,7 +82,7 @@ pub fn setup(mut commands: Commands) {
                         ..default()
                     },
                     BorderColor(hud::amber()),
-                    BackgroundColor(hud::ink()),
+                    BackgroundColor(hud::panel()),
                 ))
                 .with_children(|panel| {
                     panel.spawn(hud::text("Game menu", 29., hud::amber()));
