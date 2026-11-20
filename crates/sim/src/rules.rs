@@ -79,7 +79,7 @@ pub(crate) fn credit(view: &mut PlayerView, amount: u16) {
 
 pub(crate) fn buy_kit(view: &mut PlayerView) {
     if view.money >= KIT_COST
-        && (view.rifle.magazine < MAGAZINE || view.armor < Loadout::Armored.armor())
+        && (!view.rifle.owns(crate::Weapon::Ak) || view.armor < Loadout::Armored.armor())
     {
         view.money -= KIT_COST;
         view.rifle = Loadout::Armored.rifle();
@@ -134,7 +134,7 @@ impl World {
                     player.view.deaths = 0;
                 }
             } else if previous.hp > 0 {
-                player.view.rifle = Rifle::with_magazine(previous.rifle.magazine);
+                player.view.rifle = previous.rifle.next_round();
                 player.view.armor = previous.armor;
             }
         }
@@ -313,7 +313,7 @@ impl World {
                 })
                 .collect();
             for (id, damage) in hits {
-                self.apply_damage(id, damage, None);
+                self.apply_damage(id, damage, None, pos, None);
             }
         }
         self.round.bomb = BombView::None;

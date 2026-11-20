@@ -27,31 +27,31 @@ pub(crate) fn arrived(body: Body, goal: Vec3) -> bool {
     (body.pos - goal).with_y(0.).length() < 0.18 && body.vel.length() < 0.35
 }
 
-struct Squad {
+pub(super) struct Squad {
     peers: Vec<Peer>,
     clock: Instant,
 }
 
 impl Squad {
-    fn join(addr: &str, count: usize) -> Result<Self, String> {
+    pub(super) fn join(addr: &str, count: usize) -> Result<Self, String> {
         Ok(Self {
             peers: connect(addr, "", Impairment::default(), count, None)?,
             clock: Instant::now(),
         })
     }
 
-    fn frame(&self) -> &Frame {
+    pub(super) fn frame(&self) -> &Frame {
         // connect() returns only after every slot has received a player snapshot.
         self.peers[0].frame().unwrap()
     }
 
-    fn player(&self, id: u16) -> Result<&PlayerView, String> {
+    pub(super) fn player(&self, id: u16) -> Result<&PlayerView, String> {
         self.frame()
             .player(id)
             .ok_or_else(|| format!("missing player {id}"))
     }
 
-    fn tick(&mut self, inputs: &[(u16, Input)]) -> Result<(), String> {
+    pub(super) fn tick(&mut self, inputs: &[(u16, Input)]) -> Result<(), String> {
         for p in &mut self.peers {
             p.poll(None)?;
             let input = inputs
@@ -68,7 +68,7 @@ impl Squad {
         Ok(())
     }
 
-    fn until(
+    pub(super) fn until(
         &mut self,
         description: &str,
         seconds: u64,
@@ -115,7 +115,7 @@ impl Squad {
         )
     }
 
-    fn walk(&mut self, goals: &[(u16, Vec3)]) -> Result<(), String> {
+    pub(super) fn walk(&mut self, goals: &[(u16, Vec3)]) -> Result<(), String> {
         self.until(
             "moving to relay waypoint",
             9,

@@ -2,7 +2,7 @@
 //! controller which can only emit the same tick input as a connected player.
 use crate::{
     motion::{look_direction, RADIUS},
-    Arena, Body, BombView, Input, Mode, Phase, PlayerView, RoundView, Vec3, TICK_RATE,
+    Arena, Body, BombView, Input, Mode, Phase, PlayerView, RoundView, Vec3, Weapon, TICK_RATE,
 };
 use std::f32::consts::{FRAC_PI_4, PI, TAU};
 
@@ -10,6 +10,18 @@ pub const DEFAULT_BOT_SEED: u32 = 6619;
 pub const SHOT_HEARING_RANGE: f32 = 65.;
 pub const STEP_HEARING_RANGE: f32 = 23.;
 pub const STEP_STRIDE: f32 = 1.85;
+pub const MELEE_HEARING_RANGE: f32 = 12.;
+pub const OCCLUDED_GAIN: f32 = 0.52;
+
+pub fn sound_gain(arena: &Arena, listener: Vec3, source: Vec3) -> f32 {
+    let delta = source - listener;
+    let distance = delta.length();
+    if distance > 0.15 && arena.ray_distance(listener, delta, distance) < distance - 0.15 {
+        OCCLUDED_GAIN
+    } else {
+        1.0
+    }
+}
 
 fn mix(mut value: u32) -> u32 {
     value = (value ^ (value >> 16)).wrapping_mul(0x85eb_ca6b);
@@ -256,7 +268,7 @@ impl BotBrain {
             && has_line(arena, me.body.eye(), point)
     }
 
-    fn hear(&mut self, tick: u32, me: &PlayerView, players: &[PlayerView]) {
+    fn hear(&mut self, tick: u32, me: &PlayerView, players: &[PlayerView], arena: &Arena) {
         self.steps.retain(|state| {
             players
                 .iter()
@@ -293,15 +305,26 @@ impl BotBrain {
             // The only output of hidden movement is a coarse direction *when*
             // that player actually crosses an audible footfall or fires.
             let event = if new_shot {
-                p.shot.map(|shot| (shot.origin, SHOT_HEARING_RANGE))
+                p.shot.map(|shot| {
+                    let range = if shot.weapon == Weapon::Knife {
+                        MELEE_HEARING_RANGE
+                    } else {
+                        SHOT_HEARING_RANGE
+                    };
+                    (shot.origin, range)
+                })
             } else if stepped {
                 Some((p.body.pos, STEP_HEARING_RANGE))
             } else {
                 None
             };
             if let Some((point, range)) = event {
-                let delta = point - me.body.pos;
-                let loudness = 1. - delta.length() / range;
+                let delta = point - me.body.eye();
+                let proximity = 1. - delta.length() / range;
+                if proximity <= 0. {
+                    continue;
+                }
+                let loudness = proximity * sound_gain(arena, me.body.eye(), point);
                 if loudness > loudest {
                     loudest = loudness;
                     bearing = Some((angle(delta) / FRAC_PI_4).round() * FRAC_PI_4);
@@ -564,7 +587,27 @@ impl BotBrain {
             input.buy = round.phase == Phase::Buy && tick % 16 == u32::from(self.id) % 16;
             return input;
         }
-        self.hear(tick, me, players);
+        if mode == Mode::Deathmatch {
+            // Stable assignments vary the lobby on spawn; a new life rotates the kit.
+            let slot = if self.id >= crate::wire::FIRST_BOT_ID {
+                self.id - crate::wire::FIRST_BOT_ID
+            } else {
+                self.id.saturating_sub(1)
+            };
+            let choices = [
+                Weapon::M4,
+                Weapon::Pistol,
+                Weapon::Ak,
+                Weapon::Smg,
+                Weapon::Sniper,
+            ];
+            let rotation = u32::from(slot).wrapping_add(me.life.wrapping_sub(1));
+            let preferred = choices[(rotation % choices.len() as u32) as usize];
+            if me.rifle.weapon != preferred && me.rifle.owns(preferred) {
+                input.equip = Some(preferred);
+            }
+        }
+        self.hear(tick, me, players, arena);
         if tick >= self.next_scan {
             self.scan(tick, mode, me, players, round, arena);
         }
@@ -629,10 +672,16 @@ impl BotBrain {
         input.yaw = me.yaw + turn(me.yaw, yaw).clamp(-max_turn, max_turn);
         input.pitch = (me.pitch + (pitch - me.pitch).clamp(-max_turn, max_turn)).clamp(-1.55, 1.55);
         if wants_shot && turn(input.yaw, yaw).abs() < 0.085 && (input.pitch - pitch).abs() < 0.075 {
-            input.fire = self.skill < 0.55 || (tick + u32::from(self.id) * 9) % 54 < 34;
+            input.fire = if me.rifle.weapon.spec().automatic {
+                self.skill < 0.55 || (tick + u32::from(self.id) * 9) % 54 < 34
+            } else {
+                // A semi-auto needs a released trigger between shots.
+                me.rifle.cooldown_left <= 1 && tick % 2 == u32::from(self.id) % 2
+            };
         }
         if !input.fire
-            && me.rifle.ammo < 8
+            && me.rifle.weapon != Weapon::Knife
+            && me.rifle.ammo < (me.rifle.magazine / 4).max(1)
             && self.contact.is_none_or(|c| tick.wrapping_sub(c.seen) > 80)
         {
             input.reload = true;

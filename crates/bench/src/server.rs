@@ -3,7 +3,7 @@ use sendit_sim::{
     bots::{BotBrain, BotNav, DEFAULT_BOT_SEED},
     replay::{Trace, TraceWriter},
     wire::{decode, encode, ClientMsg, Command, ServerMsg, INPUT_REDUNDANCY},
-    Arena, Input, Mode, Phase, Tuning, World,
+    Arena, Input, Mode, Phase, Tuning, Weapon, World,
 };
 use serde_json::{json, Value};
 use std::{collections::VecDeque, f32::consts::TAU, time::Instant};
@@ -99,7 +99,8 @@ pub fn replay_run(arena: Arena, tuning: Tuning, trace: &Trace) -> Result<Value, 
             json!({
                 "id":p.id, "position":p.body.pos.to_array(), "velocity":p.body.vel.to_array(),
                 "hp":p.hp, "shot_tick":p.shot_tick, "shots_fired":p.rifle.shots_fired,
-                "last_shot_direction":p.shot.map(|s| s.direction.to_array())
+                "last_shot_direction":p.shot.map(|s| s.direction.to_array()),
+                "equipped":p.rifle.weapon, "active_magazine_rounds":p.rifle.ammo
             })
         })
         .collect();
@@ -107,7 +108,7 @@ pub fn replay_run(arena: Arena, tuning: Tuning, trace: &Trace) -> Result<Value, 
         "map":trace.header.map, "workload":trace.header.source, "ticks":trace.duration(),
         "players":players, "mode":"practice", "capture_mode":trace.header.mode,
         "friction":tuning.friction, "captured_start_states":seeded,
-        "start_state":if seeded > 0 {"captured player poses and rifles"} else {"fresh match spawns"},
+        "start_state":if seeded > 0 {"captured player poses and inventories"} else {"fresh match spawns"},
         "scope":"input drill; independent match events and network corrections are outside this recording"
     }))
 }
@@ -180,7 +181,7 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
     let mut latest_snapshot = 0;
     let mut snapshots = 0;
     let mut phase_ticks = [0u32; 5];
-    let mut shots = 0u64;
+    let mut attacks = [0u64; Weapon::ALL.len()];
     for tick in 0..(warmup + ticks) {
         if tick == warmup {
             started = Instant::now();
@@ -276,15 +277,14 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
                 Phase::Ended => 4,
             };
             phase_ticks[phase] += 1;
-            shots += player_ids
+            for shot in player_ids
                 .iter()
-                .copied()
-                .filter(|&id| {
-                    world
-                        .view(id)
-                        .is_some_and(|p| p.shot_tick == world.tick && p.shot.is_some())
-                })
-                .count() as u64;
+                .filter_map(|id| world.view(*id))
+                .filter(|p| p.shot_tick == world.tick)
+                .filter_map(|p| p.shot)
+            {
+                attacks[shot.weapon.index()] += 1;
+            }
         }
     }
     let wall = started.elapsed().as_secs_f64();
@@ -322,7 +322,8 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
         "tick_hz":TICK_HZ,"snapshot_hz":TICK_HZ/SNAPSHOT_INTERVAL,"warmup_ticks":warmup,
         "measured_ticks":ticks,"snapshots_serialized":snapshots,"simulated_seconds":simulated_seconds,
         "phase_ticks":{"warmup":phase_ticks[0],"buy":phase_ticks[1],"live":phase_ticks[2],"planted":phase_ticks[3],"ended":phase_ticks[4]},
-        "rifle_shots":shots,"ending_round":world.round_view().number,"ending_score":world.round_view().score,
+        "rifle_shots":attacks[Weapon::M4.index()] + attacks[Weapon::Ak.index()] + attacks[Weapon::Sniper.index()],
+        "attacks_by_weapon":Weapon::ALL.map(|w| json!({"weapon":w, "attacks":attacks[w.index()]})),"ending_round":world.round_view().number,"ending_score":world.round_view().score,
         "deadline_ms":to_ms(DEADLINE_NS),"work_over_deadline_ticks":missed,
         "tick_ms":{"p50":to_ms(metrics::percentile(&samples,50)),"p95":to_ms(metrics::percentile(&samples,95)),
             "p99":to_ms(metrics::percentile(&samples,99)),"max":to_ms(*samples.last().unwrap())},

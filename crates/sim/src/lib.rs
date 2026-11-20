@@ -1,5 +1,6 @@
 //! Sendit's shared deterministic gameplay. Positions are feet coordinates in meters.
 //! One simulation step always advances 1/128 s, regardless of render or packet cadence.
+pub mod arsenal;
 pub mod bots;
 pub mod map;
 pub mod motion;
@@ -9,13 +10,14 @@ pub mod rules;
 pub mod wire;
 pub mod world;
 
+pub use arsenal::{Weapon, WeaponSpec};
 pub use glam::Vec3;
 pub use map::Arena;
 pub use motion::{step, Body, Input, Tuning};
 pub use rifle::{Rifle, Shot};
 pub use rules::{Loadout, RoundResult};
 pub use wire::Command;
-pub use world::{BombView, Mode, Phase, PlayerView, RoundView, World};
+pub use world::{BombView, Hit, Mode, Phase, PlayerView, RoundView, World};
 
 pub const TICK_RATE: u32 = 128;
 pub const MAX_REWIND: u32 = 25;

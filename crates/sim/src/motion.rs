@@ -1,6 +1,7 @@
 //! Fixed-tick movement shared by prediction, replay, and server authority.
 //! Positions denote the centre of the player's feet. Distances are metres.
 use crate::map::{Arena, Axis, Ramp};
+use crate::Weapon;
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,9 @@ pub struct Input {
     pub drop_bomb: bool,
     pub buy: bool,
     pub reload: bool,
+    /// A one-tick equipment request. Repeating the current slot is harmless.
+    #[serde(default)]
+    pub equip: Option<Weapon>,
 }
 
 impl Input {
@@ -39,6 +43,7 @@ impl Input {
             self.buy = false;
             self.drop_bomb = false;
             self.reload = false;
+            self.equip = None;
         }
         self
     }

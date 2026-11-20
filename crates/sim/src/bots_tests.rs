@@ -274,3 +274,69 @@ fn gunfire_behind_the_camera_supplies_only_an_audible_bearing() {
         }
     }
 }
+
+#[test]
+fn a_clear_sound_beats_a_nearer_muffled_shot_without_granting_sight() {
+    let (world, _) = setup("drill", Mode::Practice);
+    let me = *world.view(1).unwrap();
+    let mut blocked = *world.view(2).unwrap();
+    blocked.body = Body::at(Vec3::new(4.8, 0., 0.4));
+    let mut clear = blocked;
+    clear.id = 3;
+    clear.body = Body::at(Vec3::new(0., 0., -9.));
+    assert_eq!(
+        sound_gain(&world.arena, me.body.eye(), blocked.body.eye()),
+        OCCLUDED_GAIN
+    );
+    assert_eq!(
+        sound_gain(&world.arena, me.body.eye(), clear.body.eye()),
+        1.
+    );
+    for player in [&mut blocked, &mut clear] {
+        player.shot = crate::Rifle::default().tick(
+            Input {
+                fire: true,
+                ..Input::default()
+            },
+            &player.body,
+            20,
+            9,
+            &world.tuning,
+        );
+        player.shot_tick = 20;
+    }
+    let mut bot = BotBrain::new(1, 0.8, DEFAULT_BOT_SEED);
+    bot.hear(20, &me, &[me, blocked, clear], &world.arena);
+    assert_eq!(bot.heard, Some((20, 0.0)));
+    assert!(bot.contact.is_none());
+}
+
+#[test]
+fn deathmatch_bots_draw_and_fire_five_different_kits_using_player_inputs() {
+    for (slot, weapon) in [
+        Weapon::M4,
+        Weapon::Pistol,
+        Weapon::Ak,
+        Weapon::Smg,
+        Weapon::Sniper,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = crate::wire::FIRST_BOT_ID + slot as u16;
+        let arena = Arena::load("drill").unwrap();
+        let nav = BotNav::new(&arena);
+        let mut world = World::new(arena, Mode::Deathmatch, Tuning::default());
+        assert!(world.add_team(id, 0) && world.add_team(9, 1));
+        let mut brain = BotBrain::new(id, 1.0, DEFAULT_BOT_SEED);
+        for _ in 0..(TICK_RATE * 4) {
+            drive(&mut world, &nav, &mut brain);
+            if world.view(id).unwrap().shot.is_some() {
+                break;
+            }
+        }
+        let bot = world.view(id).unwrap();
+        assert_eq!(bot.rifle.weapon, weapon);
+        assert_eq!(bot.shot.map(|s| s.weapon), Some(weapon));
+    }
+}

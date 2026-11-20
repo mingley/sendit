@@ -1,10 +1,13 @@
 //! Authoritative player lifetimes, damage and bounded target rewind.
 use crate::map::Spawn;
+#[cfg(test)]
+mod arsenal_tests;
 mod deathmatch;
 use crate::motion::{HEIGHT, RADIUS};
 use crate::rules::{credit, Loadout, RoundResult, RuleState, KILL_REWARD, START_MONEY, TEAM_CAP};
 use crate::{
-    shot_seed, step, Arena, Body, Command, Input, Rifle, Shot, Tuning, Vec3, MAX_REWIND, TICK_RATE,
+    shot_seed, step, Arena, Body, Command, Input, Rifle, Shot, Tuning, Vec3, Weapon, MAX_REWIND,
+    TICK_RATE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,6 +55,17 @@ pub struct RoundView {
     pub match_over: bool,
 }
 
+/// Latest authoritative health loss. The origin stays fixed even if the source
+/// moves, leaves, or is hidden when a victim receives a later snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Hit {
+    pub tick: u32,
+    pub source: Option<u16>,
+    pub origin: Vec3,
+    pub weapon: Option<Weapon>,
+    pub damage: u8,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PlayerView {
     pub id: u16,
@@ -71,6 +85,8 @@ pub struct PlayerView {
     pub kills: u16,
     pub deaths: u16,
     pub armed: bool,
+    #[serde(default)]
+    pub last_hit: Option<Hit>,
 }
 
 pub(crate) struct Player {
@@ -154,11 +170,12 @@ impl World {
                 Phase::Live | Phase::Planted | Phase::Ended
             );
         let loadout = self.spawn_loadout();
+        let rifle = self.spawn_weapon(loadout);
         let view = PlayerView {
             id,
             team,
             body: Body::at(spawn.pos),
-            rifle: loadout.rifle(),
+            rifle,
             yaw: spawn.yaw,
             pitch: 0.,
             hp: if waiting { 0 } else { 100 },
@@ -171,7 +188,8 @@ impl World {
             money: if competitive { START_MONEY } else { 0 },
             kills: 0,
             deaths: 0,
-            armed: true,
+            armed: self.mode != Mode::Surf,
+            last_hit: None,
         };
         self.players.insert(
             id,
@@ -240,6 +258,10 @@ impl World {
             return;
         };
         let loadout = self.spawn_loadout();
+        let mut rifle = self.spawn_weapon(loadout);
+        if self.mode == Mode::Deathmatch {
+            rifle = rifle.ready_with(current.view.rifle.weapon);
+        }
         let player = self.players.get_mut(&id).unwrap();
         let v = &mut player.view;
         v.life = v.life.wrapping_add(1);
@@ -247,12 +269,13 @@ impl World {
         v.yaw = spawn.yaw;
         v.pitch = 0.;
         v.hp = 100;
-        v.rifle = loadout.rifle();
+        v.rifle = rifle;
         v.armor = loadout.armor();
         v.shot = None;
         v.shot_tick = 0;
         v.rewind_ticks = 0;
-        v.armed = true;
+        v.armed = self.mode != Mode::Surf;
+        v.last_hit = None;
         player.input = Input {
             yaw: spawn.yaw,
             ..Input::default()
@@ -266,6 +289,14 @@ impl World {
             Mode::Competitive => Loadout::Light,
             Mode::Deathmatch => self.rules.dm_loadout,
             _ => Loadout::Standard,
+        }
+    }
+
+    fn spawn_weapon(&self, loadout: Loadout) -> Rifle {
+        match self.mode {
+            Mode::Competitive => loadout.rifle().competitive_base(),
+            Mode::Surf => loadout.rifle().unarmed(),
+            _ => loadout.rifle(),
         }
     }
 
@@ -328,14 +359,26 @@ impl World {
             }
             // Briefly carry analog intent over packet gaps. Edge actions require new input.
             let age = self.tick.wrapping_sub(player.received_at);
-            let mut input = player.input.at_age(age);
+            let input = player.input.at_age(age);
             view.yaw = input.yaw;
             view.pitch = input.pitch;
             if self.mode == Mode::Competitive
                 && matches!(self.round.phase, Phase::Buy | Phase::Ended)
             {
-                if self.round.phase == Phase::Buy && input.buy {
-                    crate::rules::buy_kit(view);
+                if self.round.phase == Phase::Buy {
+                    if input.buy {
+                        crate::rules::buy_kit(view);
+                    }
+                    view.rifle.tick(
+                        Input {
+                            equip: input.equip,
+                            ..Input::default()
+                        },
+                        &view.body,
+                        self.tick,
+                        shot_seed(id, view.ack),
+                        &self.tuning,
+                    );
                 }
                 continue;
             }
@@ -348,7 +391,9 @@ impl World {
                 }
                 continue;
             }
-            input.fire &= view.armed && self.mode != Mode::Surf;
+            if !view.armed || self.mode == Mode::Surf {
+                continue;
+            }
             if let Some(shot) = view.rifle.tick(
                 input,
                 &view.body,
@@ -362,7 +407,6 @@ impl World {
                 } else {
                     age.min(MAX_REWIND)
                 };
-                view.shot = Some(shot);
                 view.shot_tick = self.tick;
                 view.rewind_ticks = rewind as u8;
                 self.shots.push((id, self.tick.wrapping_sub(rewind), shot));
@@ -391,9 +435,19 @@ impl World {
                 }),
         );
         for i in 0..self.shots.len() {
-            let (id, time, shot) = self.shots[i];
-            if let Some(victim) = self.trace(id, time, shot) {
-                self.damage(id, victim, 34);
+            let (id, time, mut shot) = self.shots[i];
+            (shot.hit, shot.distance) = self.trace(id, time, shot);
+            if let Some(victim) = shot.hit {
+                self.apply_damage(
+                    victim,
+                    shot.weapon.spec().damage,
+                    Some(id),
+                    shot.origin,
+                    Some(shot.weapon),
+                );
+            }
+            if let Some(shooter) = self.players.get_mut(&id) {
+                shooter.view.shot = Some(shot);
             }
         }
         if self.mode == Mode::Competitive {
@@ -401,12 +455,14 @@ impl World {
         }
     }
 
-    fn trace(&self, id: u16, time: u32, shot: Shot) -> Option<u16> {
+    fn trace(&self, id: u16, time: u32, shot: Shot) -> (Option<u16>, f32) {
+        let mut limit =
+            self.arena
+                .ray_distance(shot.origin, shot.direction, shot.weapon.spec().range);
         let frame = &self.history[time as usize % self.history.len()];
         if frame.tick != time {
-            return None;
+            return (None, limit);
         }
-        let mut limit = self.arena.ray_distance(shot.origin, shot.direction, 200.0);
         let mut target = None;
         for pose in &frame.poses {
             let Some(player) = self.view(pose.id) else {
@@ -425,22 +481,38 @@ impl World {
                 target = Some(pose.id);
             }
         }
-        target
+        (target, limit)
     }
 
+    #[cfg(test)]
     pub(crate) fn damage(&mut self, shooter: u16, target: u16, amount: u8) {
+        if let Some(p) = self.view(shooter) {
+            self.apply_damage(
+                target,
+                amount,
+                Some(shooter),
+                p.body.eye(),
+                Some(p.rifle.weapon),
+            );
+        }
+    }
+
+    pub(crate) fn apply_damage(
+        &mut self,
+        target: u16,
+        amount: u8,
+        source: Option<u16>,
+        origin: Vec3,
+        weapon: Option<Weapon>,
+    ) {
         if self.mode == Mode::Competitive
-            && self
-                .view(shooter)
+            && source
+                .and_then(|id| self.view(id))
                 .zip(self.view(target))
                 .is_some_and(|(a, b)| a.team == b.team)
         {
             return;
         }
-        self.apply_damage(target, amount, Some(shooter));
-    }
-
-    pub(crate) fn apply_damage(&mut self, target: u16, amount: u8, killer: Option<u16>) {
         let Some(player) = self.players.get_mut(&target) else {
             return;
         };
@@ -449,10 +521,21 @@ impl World {
         }
         let absorbed = (amount / 3).min(player.view.armor);
         player.view.armor -= absorbed;
-        if amount - absorbed >= player.view.hp {
-            self.eliminate(target, killer);
+        let health_loss = (amount - absorbed).min(player.view.hp);
+        if health_loss == 0 {
+            return;
+        }
+        player.view.last_hit = Some(Hit {
+            tick: self.tick,
+            source,
+            origin,
+            weapon,
+            damage: health_loss,
+        });
+        if health_loss == player.view.hp {
+            self.eliminate(target, source);
         } else {
-            player.view.hp -= amount - absorbed;
+            player.view.hp -= health_loss;
         }
     }
 

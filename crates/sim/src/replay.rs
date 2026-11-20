@@ -9,7 +9,7 @@ use std::{
     path::Path,
 };
 
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const TICK_HZ: u16 = 128;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -239,10 +239,7 @@ impl Trace {
                         || !state.body.vel.is_finite()
                         || !state.yaw.is_finite()
                         || !state.pitch.is_finite()
-                        || state.rifle.magazine == 0
-                        || state.rifle.magazine > crate::rifle::MAGAZINE
-                        || state.rifle.ammo > state.rifle.magazine
-                        || state.rifle.recoil_index >= 16
+                        || !state.rifle.valid_state()
                         || starts
                             .entry(state.id)
                             .or_default()
@@ -430,5 +427,57 @@ mod tests {
         .unwrap();
         assert!(Trace::read(format!("{}\n{entry}\n{entry}", header()).as_bytes()).is_err());
         assert!(Trace::read(header().replace("128", "64").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn original_v2_desktop_trace_keeps_its_m4_and_axes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/relay-desktop.jsonl");
+        let trace = Trace::load(path).unwrap();
+        assert_eq!(trace.header.version, 2);
+        let start = trace.start_at(0, 0).unwrap();
+        assert_eq!(
+            (start.rifle.weapon, start.rifle.ammo),
+            (crate::Weapon::M4, 30)
+        );
+        assert!(start.last_hit.is_none());
+        assert!(trace.command_at(0, 0, 10).unwrap().input.equip.is_none());
+        assert!(trace.duration() > 900);
+    }
+
+    #[test]
+    fn arsenal_trace_restores_melee_empty_mag_and_large_smg_mag() {
+        use crate::{Arena, Weapon, World};
+        let mut world = World::new(
+            Arena::load("drill").unwrap(),
+            Mode::Deathmatch,
+            Tuning::default(),
+        );
+        assert!(world.add(1));
+        let header = r#"{"version":3,"tick_hz":128,"map":"drill","source":"test"}"#;
+        for weapon in [Weapon::Knife, Weapon::Smg] {
+            let command = Command {
+                seq: world.tick + 1,
+                seen_tick: world.tick,
+                input: Input {
+                    equip: Some(weapon),
+                    ..Input::default()
+                },
+            };
+            world.advance(&[(1, command)]);
+            let state = *world.view(1).unwrap();
+            assert_eq!(state.rifle.weapon, weapon);
+            let start = serde_json::to_string(&Event::Start { tick: 10, state }).unwrap();
+            let sample = serde_json::to_string(&Event::Sample {
+                tick: 10,
+                id: 1,
+                input: command.input,
+                seq: Some(10),
+                rewind: Some(0),
+            })
+            .unwrap();
+            let trace = Trace::read(format!("{header}\n{start}\n{sample}").as_bytes()).unwrap();
+            assert_eq!(trace.start_at(0, 0).unwrap().rifle, state.rifle);
+            assert_eq!(trace.input_at(0, 0).equip, Some(weapon));
+        }
     }
 }

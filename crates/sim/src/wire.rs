@@ -4,7 +4,7 @@ use crate::{Input, Mode, PlayerView, RoundView, Tuning};
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub const PROTOCOL: u16 = 4;
+pub const PROTOCOL: u16 = 5;
 /// UDP player IDs are below this stable server-assigned bot range.
 pub const FIRST_BOT_ID: u16 = 1001;
 /// Custom maps travel as individually requested sub-MTU datagrams.
@@ -114,5 +114,85 @@ mod tests {
         bytes.push(0);
         assert!(decode::<ClientMsg>(&bytes).is_err());
         assert!(decode::<ClientMsg>(&vec![0; MAX_PACKET + 1]).is_err());
+    }
+
+    #[test]
+    fn full_arsenal_snapshots_and_redundant_commands_fit_wire_bounds() {
+        use crate::{Arena, Hit, Weapon, World};
+        let mut world = World::new(
+            Arena::load("drill").unwrap(),
+            Mode::Deathmatch,
+            Tuning::default(),
+        );
+        for id in 1..=32 {
+            assert!(world.add(id));
+        }
+        let mut players = world.views();
+        for p in &mut players {
+            let input = Input {
+                fire: true,
+                ..Input::default()
+            };
+            let mut shot = p
+                .rifle
+                .tick(input, &p.body, u32::MAX, u32::MAX, &world.tuning)
+                .unwrap();
+            shot.hit = Some(u16::MAX);
+            p.shot = Some(shot);
+            p.id = u16::MAX - p.id;
+            p.kills = u16::MAX;
+            p.deaths = u16::MAX;
+            p.money = u16::MAX;
+            p.shot_tick = u32::MAX;
+            p.life = u32::MAX;
+            p.ack = u32::MAX;
+            p.rifle.shots_fired = u32::MAX;
+            p.last_hit = Some(Hit {
+                tick: u32::MAX,
+                source: Some(u16::MAX),
+                origin: p.body.eye(),
+                damage: 100,
+                weapon: Some(Weapon::Sniper),
+            });
+        }
+        let snapshot = |count| {
+            encode(&ServerMsg::Snapshot {
+                tick: u32::MAX,
+                players: players[..count].to_vec(),
+                round: world.round_view(),
+            })
+            .unwrap()
+        };
+        let max_slots = snapshot(32);
+        let ServerMsg::Snapshot {
+            players: restored, ..
+        } = decode(&max_slots).unwrap()
+        else {
+            panic!("expected full snapshot")
+        };
+        assert_eq!(restored.len(), 32);
+        assert_eq!(restored[31].last_hit, players[31].last_hit);
+        assert!(max_slots.len() < MAX_PACKET);
+        let commands = vec![
+            Command {
+                seq: u32::MAX,
+                seen_tick: u32::MAX,
+                input: Input {
+                    equip: Some(Weapon::Smg),
+                    ..Input::default()
+                }
+            };
+            INPUT_REDUNDANCY
+        ];
+        let outbound = encode(&ClientMsg::Input {
+            token: u64::MAX,
+            commands,
+        })
+        .unwrap();
+        assert!(
+            outbound.len() <= 1200,
+            "input must fit an unfragmented datagram"
+        );
+        eprintln!("arsenal payload bytes: six-command input {}, 10-player snapshot {}, 32-player snapshot {}", outbound.len(), snapshot(10).len(), max_slots.len());
     }
 }
