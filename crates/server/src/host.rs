@@ -6,7 +6,7 @@ use crate::discovery::{self, Listing, Publisher};
 use crate::stats::Traffic;
 use sendit_sim::replay::TraceWriter;
 use sendit_sim::wire::{decode, encode, ClientMsg, Command, ServerMsg, CHUNK_BYTES, PROTOCOL};
-use sendit_sim::{Arena, Mode, World};
+use sendit_sim::{Arena, Input, Mode, PlayerView, World};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -28,6 +28,51 @@ struct PendingJoin {
     issued: Instant,
 }
 
+/// UDP commands carry absolute aim and can arrive after their player has
+/// respawned. A snapshot timestamp tells us which life authored the command.
+#[derive(Default)]
+struct DeathmatchInput {
+    life: Option<u32>,
+    respawn_tick: Option<u32>,
+    reports_ticks: bool,
+}
+
+impl DeathmatchInput {
+    fn for_tick(
+        &mut self,
+        view: &PlayerView,
+        tick: u32,
+        command: Option<Command>,
+    ) -> Option<Command> {
+        if self
+            .life
+            .replace(view.life)
+            .is_some_and(|old| old != view.life)
+        {
+            self.respawn_tick = Some(tick);
+        }
+        let mut command = command?;
+        self.reports_ticks |= command.seen_tick != 0;
+        if let Some(spawn) = self.respawn_tick {
+            let elapsed = tick.wrapping_sub(spawn);
+            let saw_spawn = command.seen_tick.wrapping_sub(spawn) <= elapsed;
+            // A timestamp-less adapter cannot confirm a snapshot. Publish the
+            // new facing for a snapshot interval, then resume legacy commands.
+            if saw_spawn || (!self.reports_ticks && elapsed >= SNAPSHOT_INTERVAL) {
+                self.respawn_tick = None;
+            } else {
+                // Consume the sequence so redundant packets cannot reapply it.
+                command.input = Input {
+                    yaw: view.yaw,
+                    pitch: view.pitch,
+                    ..Input::default()
+                };
+            }
+        }
+        Some(command)
+    }
+}
+
 struct Session {
     id: u16,
     name: String,
@@ -37,6 +82,7 @@ struct Session {
     last_seq: u32,
     last_reset: Option<u32>,
     pending_welcome: bool,
+    deathmatch_input: DeathmatchInput,
     chunk_window: u32,
     chunk_count: u8,
     pending: Vec<Command>,
@@ -320,6 +366,7 @@ impl Host {
                 last_seq: 0,
                 last_reset: None,
                 pending_welcome: true,
+                deathmatch_input: DeathmatchInput::default(),
                 chunk_window: 0,
                 chunk_count: 0,
                 pending: Vec::with_capacity(MAX_QUEUED_COMMANDS),
@@ -477,7 +524,15 @@ impl Host {
                 println!("timeout id={}", session.id);
                 return false;
             }
-            if let Some(command) = session.next_command() {
+            let mut command = session.next_command();
+            if self.config.mode == Mode::Deathmatch {
+                if let Some(view) = self.world.view(session.id) {
+                    command = session
+                        .deathmatch_input
+                        .for_tick(view, self.world.tick, command);
+                }
+            }
+            if let Some(command) = command {
                 self.inputs.push((session.id, command));
             }
             true
@@ -537,6 +592,155 @@ mod tests {
     use sendit_sim::Input;
 
     #[test]
+    fn deathmatch_inflight_input_cannot_turn_or_fire_before_the_new_life_snapshot() {
+        use sendit_sim::Tuning;
+        let tuning = Tuning {
+            shot_interval_ticks: 1,
+            recoil_scale: 0.,
+            burst_spread: 0.,
+            ..Tuning::default()
+        };
+        let mut world = World::new(Arena::load("drill").unwrap(), Mode::Deathmatch, tuning);
+        assert!(world.add(1) && world.add(2));
+        let old_life = world.view(2).unwrap().life;
+        let old_look = Input {
+            yaw: 4.445593,
+            pitch: -0.18,
+            ..Input::default()
+        };
+        let mut fence = DeathmatchInput::default();
+        let mut published_tick = 0;
+        let mut spawn = None;
+        let mut died = false;
+        while world.tick < 140 {
+            let seq = world.tick + 1;
+            let queued = Command {
+                seq,
+                seen_tick: published_tick,
+                input: Input {
+                    strafe: if died { 1. } else { 0. },
+                    fire: died,
+                    ..old_look
+                },
+            };
+            let network = fence
+                .for_tick(world.view(2).unwrap(), world.tick, Some(queued))
+                .unwrap();
+            let attacker = Command {
+                seq,
+                seen_tick: seq,
+                input: Input {
+                    fire: seq <= 3,
+                    ..Input::default()
+                },
+            };
+            world.advance(&[(1, attacker), (2, network)]);
+            let me = world.view(2).unwrap();
+            died |= me.hp == 0;
+            if me.life != old_life && spawn.is_none() {
+                spawn = Some((
+                    world.tick,
+                    *world
+                        .arena
+                        .spawns
+                        .iter()
+                        .find(|s| s.pos == me.body.pos)
+                        .unwrap(),
+                ));
+            }
+            if world.tick % SNAPSHOT_INTERVAL == 0 {
+                published_tick = world.tick;
+                if spawn.is_some() {
+                    break;
+                }
+            }
+        }
+        let (born, marker) = spawn.unwrap();
+        assert_eq!(born, 131);
+        assert_eq!(published_tick, 132);
+        let me = world.view(2).unwrap();
+        assert_eq!(
+            (me.yaw, me.pitch, me.body.pos),
+            (marker.yaw, 0., marker.pos)
+        );
+        assert!(me.shot.is_none());
+        // Another buffered pre-life packet crosses the wire after publication.
+        let late = Command {
+            seq: 133,
+            seen_tick: 128,
+            input: old_look,
+        };
+        let late = fence.for_tick(me, world.tick, Some(late)).unwrap();
+        world.advance(&[(2, late)]);
+        assert_eq!(world.view(2).unwrap().yaw, marker.yaw);
+
+        // The first real input carrying the new snapshot is effective immediately.
+        let fresh = Command {
+            seq: 134,
+            seen_tick: published_tick,
+            input: Input {
+                yaw: marker.yaw + 0.31,
+                pitch: 0.15,
+                strafe: 1.,
+                fire: true,
+                ..Input::default()
+            },
+        };
+        let fresh = fence
+            .for_tick(world.view(2).unwrap(), world.tick, Some(fresh))
+            .unwrap();
+        world.advance(&[(2, fresh)]);
+        let me = world.view(2).unwrap();
+        assert_eq!((me.yaw, me.pitch), (fresh.input.yaw, fresh.input.pitch));
+        assert_ne!(me.body.pos, marker.pos);
+        assert_eq!(me.shot_tick, world.tick);
+    }
+
+    #[test]
+    fn timestamp_less_adapter_can_control_replacement_life_after_publication() {
+        let mut world = World::new(
+            Arena::load("drill").unwrap(),
+            Mode::Deathmatch,
+            Default::default(),
+        );
+        assert!(world.add(1));
+        let mut view = *world.view(1).unwrap();
+        let mut fence = DeathmatchInput::default();
+        let command = Command {
+            input: Input {
+                strafe: 1.,
+                ..Input::default()
+            },
+            ..Command::default()
+        };
+        assert_eq!(
+            fence
+                .for_tick(&view, 4, Some(command))
+                .unwrap()
+                .input
+                .strafe,
+            1.
+        );
+        view.life += 1;
+        assert_eq!(
+            fence
+                .for_tick(&view, 11, Some(command))
+                .unwrap()
+                .input
+                .strafe,
+            0.
+        );
+        assert_eq!(
+            fence
+                .for_tick(&view, 15, Some(command))
+                .unwrap()
+                .input
+                .strafe,
+            1.
+        );
+    }
+
+    #[test]
     fn reorder_and_redundancy_never_replay_consumed_commands() {
         let mut session = Session {
             id: 1,
@@ -545,6 +749,7 @@ mod tests {
             last_packet: Instant::now(),
             last_welcome: None,
             pending_welcome: false,
+            deathmatch_input: DeathmatchInput::default(),
             chunk_window: 0,
             chunk_count: 0,
             last_seq: u32::MAX - 2,

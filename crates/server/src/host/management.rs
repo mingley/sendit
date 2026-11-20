@@ -56,6 +56,7 @@ impl Host {
             session.token = token;
             session.last_seq = 0;
             session.last_reset = None;
+            session.deathmatch_input = DeathmatchInput::default();
             session.pending.clear();
             session.pending_welcome = true;
             session.chunk_count = 0;

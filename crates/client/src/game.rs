@@ -484,6 +484,12 @@ impl Session {
         }
         let changed_life = old_self.is_none_or(|p| p.0 != life);
         if changed_life {
+            if old_self.is_some() && self.mode == Mode::Deathmatch {
+                // Start the new life displaying the current snapshot. Its first
+                // local look/movement command can then reference that same tick.
+                self.previous.clear();
+                self.previous_tick = tick;
+            }
             self.spawn = Some((body, yaw));
             self.input.yaw = yaw;
             self.input.pitch = self.spawn_pitch();
@@ -1106,6 +1112,45 @@ mod tests {
         app.update();
         assert!(!app.world().resource::<Session>().captured);
         assert!(!app.world().resource::<Session>().local_lobby);
+    }
+
+    #[test]
+    fn deathmatch_respawn_commands_reference_the_new_life_immediately() {
+        let mut world = sendit_sim::World::new(
+            Arena::load("aim").unwrap(),
+            Mode::Deathmatch,
+            Tuning::default(),
+        );
+        assert!(world.add(1) && world.add(2));
+        let mut client = Session::open(&Options {
+            local_match: false,
+            ..Options::default()
+        })
+        .unwrap();
+        client.id = Some(1);
+        client.mode = Mode::Deathmatch;
+        client.map_ready = true;
+        let mut audio = Sound::new(false);
+        let mut views = world.views();
+        views[0].hp = 0;
+        views[0].yaw = 4.445593;
+        views[0].pitch = -0.18;
+        client.snapshot(128, views.clone(), world.round_view(), &mut audio);
+        views[0].life += 1;
+        views[0].hp = 100;
+        views[0].body = Body::at(Vec3::new(9., 0., 10.));
+        views[0].yaw = 0.;
+        views[0].pitch = 0.;
+        views[1].body.pos.x += 2.;
+        client.snapshot(132, views.clone(), world.round_view(), &mut audio);
+        assert_eq!(
+            (client.input.yaw, client.input.pitch, client.seen_tick()),
+            (0., 0., 132)
+        );
+        assert_eq!(client.remote_pose(&views[1]).0, views[1].body.pos);
+        client.input.yaw = 0.31;
+        client.snapshot(136, views, world.round_view(), &mut audio);
+        assert_eq!(client.input.yaw, 0.31);
     }
 
     #[test]
