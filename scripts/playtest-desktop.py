@@ -4,7 +4,7 @@
     cargo build --release --locked --workspace
     python3 scripts/playtest-desktop.py --output-dir /tmp/sendit-playtest
 
-On Debian/Ubuntu install xvfb, x11-utils, libxtst6, tesseract-ocr-eng,
+On Debian/Ubuntu install xvfb, x11-utils, libxtst6, libxkbcommon-x11-0, tesseract-ocr-eng,
 mesa-vulkan-drivers, python3-pil and python3-numpy. Xvfb starts automatically.
 Pass --display :N to use a dedicated GPU-backed X11 display instead.
 """
@@ -173,19 +173,29 @@ def panel_button(image, word):
     rgb = np.asarray(panel, dtype=np.int16)
     r, g, b = rgb.transpose(2, 0, 1)
     amber = (r > 210) & (g > 125) & (g < 225) & (b < 155) & (r - g > 30)
-    rows = np.flatnonzero((amber.sum(axis=1) > 65))
-    for group in np.split(rows, np.flatnonzero(np.diff(rows) > 1) + 1):
-        if len(group) < 16:
-            continue
-        band = amber[group]
-        xs = np.flatnonzero(band.sum(axis=0) > len(group) * .55)
-        for columns in np.split(xs, np.flatnonzero(np.diff(xs) > 3) + 1):
-            if len(columns) < 55:
+    faces = [amber] + [np.max(np.abs(rgb - color), axis=2) <= 4
+                       for color in ([100,69,36], [48,44,34])]
+    for index, face in enumerate(faces):
+        rows = np.flatnonzero(face.sum(axis=1) > 55)
+        for group in np.split(rows, np.flatnonzero(np.diff(rows) > 1) + 1):
+            if len(group) < 15:
                 continue
-            box = (int(columns[0]), int(group[0]), int(columns[-1]) + 1, int(group[-1]) + 1)
-            label = ocr(panel.crop(box), 7)
-            if re.search(r"\b(?:" + word + r")\b", label, re.I):
-                return (left + (box[0] + box[2]) / 2, top + (box[1] + box[3]) / 2)
+            xs = np.flatnonzero(face[group].sum(axis=0) > len(group) * .55)
+            for columns in np.split(xs, np.flatnonzero(np.diff(xs) > 3) + 1):
+                if len(columns) < 50:
+                    continue
+                x0, x1 = int(columns[0])+2, int(columns[-1])-1
+                y0, y1 = int(group[0])+2, int(group[-1])-1
+                patch = rgb[y0:y1, x0:x1]
+                letters = patch.max(axis=2) < 120 if index == 0 else patch.min(axis=2) > 130
+                ys, xx = np.nonzero(letters)
+                if len(xx) < 16:
+                    continue
+                glyphs = letters[ys.min():ys.max()+1, xx.min():xx.max()+1]
+                ink = Image.fromarray(np.uint8(np.where(glyphs, 0, 255)))
+                label = ocr(ImageOps.expand(ink, 5, 255), 7)
+                if re.search(r"\b(?:" + word + r")\b", label, re.I):
+                    return (left + (x0+x1)/2, top + (y0+y1)/2)
     for row in csv.DictReader(io.StringIO(ocr(panel, 6 if word != "Click" else 11, boxes=True)), delimiter="\t"):
         if re.fullmatch(word, row["text"].strip("!.,|:"), re.I):
             return (left + (int(row["left"]) + int(row["width"]) / 2) / 2,
@@ -213,28 +223,83 @@ def visible_change(a, b):
     return round(float(np.abs(pixels(a) - pixels(b)).mean()), 2)
 
 
-def moving_rival(before, after):
-    """Locate one moving silhouette on the private Drill lane, at half resolution."""
-    w, h = after.size
-    a = np.asarray(before.resize((w//2, h//2)), dtype=np.int16)
-    b = np.asarray(after.resize((w//2, h//2)), dtype=np.int16)
-    delta = np.abs(a - b).max(axis=2) > 26
-    height, width = delta.shape
-    delta[:int(.23*height)] = False
-    delta[int(.76*height):] = False
-    # Exclude the held weapon and the fixed feedback message near the reticle.
-    delta[int(.55*height):, int(.62*width):] = False
-    delta[int(.56*height):int(.62*height), int(.34*width):int(.66*width)] = False
-    delta[:,:int(.03*width)] = False
-    delta[:,int(.97*width):] = False
-    if delta.sum() < 12 or delta.mean() > .065:
-        return None  # camera motion, a respawn or a flash, rather than one actor
-    column = int(np.convolve(delta.sum(axis=0), np.ones(12), mode="same").argmax())
-    left, right = max(0, column-12), min(width, column+13)
-    yy, xx = np.nonzero(delta[:, left:right])
-    if len(xx) < 12 or yy.max()-yy.min() < 5:
+def selected_slot(frame):
+    """Read the selected underline among the six visible, centered inventory cells."""
+    w, h = frame.size
+    left, right = round(w*.18), round(w*.82)
+    rows = np.asarray(frame.crop((left, h-56, right, h-10)), dtype=np.int16)
+    amber = np.max(np.abs(rows - [255,194,95]), axis=2) <= 7
+    others = np.max(np.abs(rows - [118,101,70]), axis=2) <= 7
+    for active, owned in zip(amber, others):
+        xx = np.flatnonzero(active | owned)
+        runs = [g for g in np.split(xx, np.flatnonzero(np.diff(xx) > 1) + 1) if len(g) >= 25]
+        if len(runs) == 6:
+            chosen = [i for i, cell in enumerate(runs, 1) if active[cell].mean() > .90]
+            if len(chosen) == 1:
+                return chosen[0]
+    return None
+
+
+def gun_pixels(frame):
+    w, h = frame.size
+    region = frame.crop((int(w*.50), int(h*.55), int(w*.92), int(h*.88)))
+    return np.asarray(region.resize((80, 48)), dtype=float)
+
+
+def weapon_caption(frame):
+    """OCR the lower-right HUD card, excluding similarly coloured masonry behind it."""
+    a = np.asarray(frame, dtype=np.int16)
+    h, w = a.shape[:2]
+    scale = min(1, max(.53, min(w/1060, h/610)))
+    right, bottom = w-round(24*scale), h-round(24*scale)
+    x, y = right-4, bottom-3
+    background = a[y, x]
+    left, top = x, y
+    while left > right-260*scale and np.abs(a[y, left] - background).max() < 28:
+        left -= 1
+    while top > bottom-75*scale and np.abs(a[top, x] - background).max() < 28:
+        top -= 1
+    card = a[top+1:bottom, left+1:right]
+    r, g, b = card.transpose(2, 0, 1)
+    pale = (r > 132) & (b > 100) & (r-g >= 1) & (r-g < 24) & (g-b > 5) & (g-b < 40)
+    rows = np.flatnonzero(pale.any(axis=1))
+    names = []
+    for group in np.split(rows, np.flatnonzero(np.diff(rows) > 1) + 1):
+        if len(group) < 3:
+            continue
+        glyphs = pale[group]
+        columns = np.flatnonzero(glyphs.any(axis=0))
+        glyphs = glyphs[:,columns[0]:columns[-1]+1]
+        word = Image.fromarray(np.uint8(np.where(glyphs, 0, 255)))
+        names.append(ocr(ImageOps.expand(word.resize((word.width*2, word.height*2),
+                                         Image.Resampling.NEAREST), 4, 255), 7))
+        break
+    ink = Image.fromarray(np.uint8(np.where(card.max(axis=2) > 135, 0, 255)))
+    if ink.height > 38:
+        ink = ink.crop((0, 0, round(ink.width*.68), round(ink.height*.53)))
+    names.append(ocr(ImageOps.expand(ink, 5, 255), 7))
+    return " ".join(names)
+
+
+
+def defender_on_drill(frame):
+    """Locate the blue uniform in the opposing half of this private, two-player drill."""
+    w, h = frame.size
+    pixels = np.asarray(frame.resize((w//2, h//2)), dtype=np.int16)
+    r, g, b = pixels.transpose(2, 0, 1)
+    blue = (b > g*1.12) & (g > r*1.2) & (b-r > 21) & (r > 27) & (r < 141)
+    blue[:int(.46*len(blue))] = False
+    blue[int(.62*len(blue)):] = False
+    blue[:, :int(.38*blue.shape[1])] = False
+    blue[:, int(.62*blue.shape[1]):] = False
+    blue[int(.59*len(blue)):, int(.65*blue.shape[1]):] = False
+    # Find the densest patch. The sight line has no other blue combatant.
+    column = int(np.convolve(blue.sum(axis=0), np.ones(11), mode="same").argmax())
+    left = max(0, column-8)
+    yy, xx = np.nonzero(blue[:, left:column+9])
+    if len(xx) < 8 or np.ptp(yy) < 3 or np.ptp(yy) > h*.17:
         return None
-    return (2*(left + np.median(xx)), 2*np.percentile(yy, 39), max(8, np.ptp(xx)))
+    return 2*(left + np.median(xx)), 2*np.percentile(yy, 42)
 
 
 class Playtest:
@@ -262,7 +327,8 @@ class Playtest:
         image = self.desk.frame() if frame is None else frame
         path = self.out / (name + ".png")
         image.save(path)
-        self.report["screenshots"].append(path.name)
+        if path.name not in self.report["screenshots"]:
+            self.report["screenshots"].append(path.name)
         return image
 
     def process(self, stack, binary, arguments, label):
@@ -386,18 +452,23 @@ class Playtest:
                        world_pixel_change=change)
             weapons = [("Knife", "KNIFE"), ("Pistol", "PISTOL"), ("M4", "M4"),
                        ("Ak", "AK"), ("Sniper", "SNIPER"), ("Smg", "SMG")]
+            previous = gun_pixels(d.frame())
             for key, (weapon, label) in enumerate(weapons, 1):
                 d.press(str(key))
                 def equipped():
                     im = d.frame()
-                    w, h = im.size
-                    text = ocr(im.crop((int(w * .82), int(h * .84), w, h)), 6)
-                    return (im, text) if re.search(r"\b" + label + r"\b", text, re.I) else None
-                im, text = wait_for(f"{label} on the rendered weapon HUD", equipped, 8)
-                self.photo("weapon-" + weapon.lower(), im)
+                    return im if selected_slot(im) == key else None
+                wait_for(f"visible inventory slot {key} highlighted", equipped, 8)
+                time.sleep(.5)  # Wait for the longest draw before comparing the held model.
+                im = self.photo("weapon-" + weapon.lower())
+                observed = selected_slot(im)
+                current = gun_pixels(im)
+                change = round(float(np.abs(current-previous).mean()), 3)
+                previous = current
                 recorded = wait_for(f"host receiving slot {key}", lambda: any(
                     str(row["input"].get("equip")).lower() == weapon.lower() for row in samples(trace)), 5)
-                self.check(f"Key {key} equips {label}", recorded, rendered=text)
+                self.check(f"Key {key} equips {label}", recorded and observed == key and change > .3,
+                           selected_slot=observed, model_pixel_change=change, rendered=weapon_caption(im))
                 if weapon == "Sniper":
                     time.sleep(.55)
                     hip = d.frame()
@@ -451,67 +522,66 @@ class Playtest:
 
     def duel(self):
         with contextlib.ExitStack() as stack:
-            host, trace = self.host(stack, "duel", "deathmatch", "--max-players", "2",
+            host, trace = self.host(stack, "duel", "competitive", "--max-players", "2",
                                     "--bots", "1", "--bot-team", "ct", "--bot-skill", "0")
             d = self.desk
-            # The opponent moves against a fixed range backdrop. Compare two
-            # actual frames while our camera is still; no bot pose is available
-            # to this control loop. This case only drives the private local host.
-            d.press("5")
-            time.sleep(.52)
-            deadline = now() + 60
-            last_seen = now()
-            last_score = last_reload = last_shot = 0
-            score = ""
+            # Both players face the common Drill lane in the normal buy phase.
+            # The defender can strafe, shoot back, and win the round.
+            d.press("b")
+            d.press("3")
+            d.move(0, 12)
+            time.sleep(.3)
+            deadline = now() + 65
+            last_sample = 0
+            next_buy = now() + 15
+            held = False
             attempts = 0
+            won = None
             while now() < deadline:
-                first = d.frame()
-                time.sleep(.10)
                 frame = d.frame()
-                target = moving_rival(first, frame)
+                target = defender_on_drill(frame)
                 if target is not None:
-                    x, y, extent = target
+                    x, y = target
                     dx, dy = x - frame.width/2, y - frame.height/2
-                    focal = frame.height / (2 * math.tan(math.radians(73 / 2)))
-                    # Align ordinary raw mouse counts with the projected torso.
-                    d.move(round(math.atan(dx / focal) * 485), round(math.atan(dy / focal) * 485))
-                    last_seen = now()
-                    if abs(dx) < max(24, extent) and abs(dy) < max(21, extent) and now() - last_shot > .29:
-                        if attempts == 0:
-                            self.photo("duel-opponent", frame)
-                        d.button(True)
-                        time.sleep(.11)
-                        d.button(False)
-                        last_shot = now()
-                        attempts += 1
-                elif now() - last_seen > 1.2:
-                    d.move(300, 0)
-                    last_seen = now() - .84
-                if now() - last_score >= .8:
-                    w, h = frame.size
-                    crop = frame.crop((int(w*.37), 9, int(w*.63), int(h*.09)))
-                    score = ocr(crop, 7)
-                    if re.search(r"\b[1-9]\d*\s*KILLS?\b", score, re.I):
-                        self.photo("duel-combat", frame)
-                        break
-                    last_score = now()
-                if attempts and attempts % 5 == 0 and now() - last_reload > 4:
-                    d.press("r")
-                    last_reload = now()
-                time.sleep(.12)
-            else:
-                self.photo("duel-no-frag")
-                raise RuntimeError(f"No confirmed frag after {attempts} shots at a visible bot; HUD {score!r}")
+                    focal = frame.height / (2 * math.tan(math.radians(73/2)))
+                    # Aim only within the visible lane; the team marking must
+                    # stay close to the reticle before a burst is allowed.
+                    if abs(dx) < 68 and abs(dy) < 30:
+                        d.move(int(np.clip(math.atan(dx/focal)*255, -30, 30)),
+                               int(np.clip(math.atan(dy/focal)*255, -10, 10)))
+                        if not held:
+                            d.button(True)
+                            held = True
+                            attempts += 1
+                            if attempts == 1:
+                                self.photo("duel-opponent", frame)
+                        if now()-last_sample > 1.0:
+                            self.photo("duel-combat", frame)
+                            last_sample = now()
+                if now() > next_buy:
+                    d.press("b")
+                    next_buy = now() + 8
+                # A new round emits the real server's starting PlayerView; its
+                # persistent K/D cannot be produced by predicted fire alone.
+                won = next((row["state"] for row in trace_events(trace)
+                            if row.get("state", {}).get("kills", 0) >= 1), None)
+                if won:
+                    break
+                time.sleep(.045)
+            d.button(False)
+            self.check("Native mouse fire earns an authoritative kill against the bot",
+                       won is not None and attempts > 0,
+                       trigger_presses=attempts, kills=won["kills"] if won else 0,
+                       deaths=won["deaths"] if won else None)
             d.key("Tab", True)
-            time.sleep(.35)
+            time.sleep(.4)
             board = self.photo("duel-scoreboard")
             d.key("Tab", False)
-            text = ocr(board, 6)
-            self.check("A real mouse-triggered shot earns a bot kill",
-                       bool(re.search("PlayerQA", text.replace(" ", ""), re.I)) and
-                       bool(re.search("bot", text, re.I)) and
-                       any(r["input"]["fire"] for r in samples(trace)),
-                       hud=score, scoreboard=text)
+            w, h = board.size
+            text = ocr(board.crop((w//2-315, int(h*.08), w//2+315, int(h*.7))), 6)
+            self.check("Live scoreboard contains the player and a bot",
+                       "playerqa" in text.replace(" ", "").lower() and "bot" in text.lower(),
+                       scoreboard=text)
             self.quit()
             host.stdin.write(b"quit\n")
             host.stdin.flush()
