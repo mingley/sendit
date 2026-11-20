@@ -1,4 +1,4 @@
-use bevy::prelude::Resource;
+use bevy::{prelude::Resource, window::WindowResolution};
 use std::path::PathBuf;
 
 const HELP: &str =
@@ -32,6 +32,7 @@ pub struct Options {
     pub sensitivity: f32,
     pub width: u32,
     pub height: u32,
+    pub(crate) explicit_resolution: bool,
     pub start_maximized: bool,
     pub record: Option<PathBuf>,
     pub replay: Option<PathBuf>,
@@ -54,6 +55,7 @@ impl Default for Options {
             sensitivity: 0.001,
             width: 1920,
             height: 1080,
+            explicit_resolution: false,
             start_maximized: false,
             record: None,
             replay: None,
@@ -67,6 +69,17 @@ impl Default for Options {
 }
 
 impl Options {
+    pub fn window_resolution(&self) -> WindowResolution {
+        let resolution = WindowResolution::new(self.width as f32, self.height as f32);
+        // AppKit normally takes window sizes in points. CLI dimensions and
+        // benchmark resolutions are backing pixels, including on Retina screens.
+        if cfg!(target_os = "macos") && (self.explicit_resolution || self.benchmark.is_some()) {
+            resolution.with_scale_factor_override(1.0)
+        } else {
+            resolution
+        }
+    }
+
     pub fn parse() -> Result<Option<Self>, String> {
         Self::parse_args(std::env::args().skip(1))
     }
@@ -74,7 +87,6 @@ impl Options {
     fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut opts = Self::default();
         let mut local_controls = false;
-        let mut size_supplied = false;
         let mut supplied_password = false;
         while let Some(flag) = args.next() {
             if flag == "-h" || flag == "--help" {
@@ -131,11 +143,11 @@ impl Options {
                 "--sensitivity" => opts.sensitivity = value.parse().map_err(|_| invalid())?,
                 "--width" => {
                     opts.width = value.parse().map_err(|_| invalid())?;
-                    size_supplied = true;
+                    opts.explicit_resolution = true;
                 }
                 "--height" => {
                     opts.height = value.parse().map_err(|_| invalid())?;
-                    size_supplied = true;
+                    opts.explicit_resolution = true;
                 }
                 "--record" => opts.record = Some(value.into()),
                 "--replay" => opts.replay = Some(value.into()),
@@ -156,7 +168,11 @@ impl Options {
         if !local_controls && opts.replay.is_some() {
             opts.local_match = false;
         }
-        if opts.local_match && !size_supplied && opts.benchmark.is_none() && opts.replay.is_none() {
+        if opts.local_match
+            && !opts.explicit_resolution
+            && opts.benchmark.is_none()
+            && opts.replay.is_none()
+        {
             opts.width = 1280;
             opts.height = 720;
             opts.start_maximized = true;
@@ -229,6 +245,30 @@ mod tests {
                 (1920, 1080, false)
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retina_uses_physical_pixels_for_cli_sizes_and_benchmarks() {
+        for (params, width, height) in [
+            (&["--width", "960", "--height", "540"][..], 960, 540),
+            (&["--benchmark", "2"][..], 1920, 1080),
+        ] {
+            let mut resolution = args(params).unwrap().window_resolution();
+            resolution.set_scale_factor(2.);
+            assert_eq!(resolution.scale_factor_override(), Some(1.0));
+            assert_eq!(
+                (resolution.physical_width(), resolution.physical_height()),
+                (width, height)
+            );
+            assert_eq!(
+                (resolution.width(), resolution.height()),
+                (width as f32, height as f32)
+            );
+        }
+        let mut normal = args(&[]).unwrap().window_resolution();
+        normal.set_scale_factor(2.);
+        assert_eq!(normal.scale_factor(), 2.);
     }
 
     #[test]

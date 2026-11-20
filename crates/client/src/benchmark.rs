@@ -304,6 +304,15 @@ fn sample(
             fail(book, &mut exit, "no primary window");
             return;
         };
+        #[cfg(target_os = "macos")]
+        let cpu = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|model| !model.is_empty());
+        #[cfg(not(target_os = "macos"))]
         let cpu = fs::read_to_string("/proc/cpuinfo")
             .ok()
             .and_then(|info| {

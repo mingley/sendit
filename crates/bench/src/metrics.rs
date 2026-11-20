@@ -10,6 +10,10 @@ fn command(exe: &str, args: &[&str]) -> Option<String> {
 }
 
 pub fn platform() -> Value {
+    #[cfg(target_os = "macos")]
+    let cpu = command("/usr/sbin/sysctl", &["-n", "machdep.cpu.brand_string"])
+        .filter(|model| !model.is_empty());
+    #[cfg(not(target_os = "macos"))]
     let cpu = fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
         info.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;

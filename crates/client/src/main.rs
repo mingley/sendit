@@ -42,7 +42,7 @@ fn main() -> AppExit {
     let mut app = App::new();
     let mut window = Window {
         title: "Sendit".into(),
-        resolution: (opts.width as f32, opts.height as f32).into(),
+        resolution: opts.window_resolution(),
         decorations: true,
         resizable: true,
         present_mode: PresentMode::AutoNoVsync,
