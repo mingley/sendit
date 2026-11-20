@@ -1,0 +1,5 @@
+/target/
+/results/
+/local-maps/
+*.jsonl
+!fixtures/*.jsonl
