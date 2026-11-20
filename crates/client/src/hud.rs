@@ -1,4 +1,6 @@
 //! A compact, high-contrast match HUD. Diagnostic details and the control sheet are opt-in.
+pub mod arsenal;
+pub mod combat;
 mod course;
 pub mod scoreboard;
 use crate::{game::Session, options::Options};
@@ -9,14 +11,14 @@ use sendit_sim::{
 };
 use std::time::{Duration, Instant};
 
-fn ink() -> Color {
-    Color::srgba(0.039, 0.066, 0.071, 0.92)
+pub(crate) fn ink() -> Color {
+    Color::srgba(0.085, 0.079, 0.058, 0.92)
 }
-fn ash() -> Color {
-    Color::srgb_u8(189, 205, 202)
+pub(crate) fn ash() -> Color {
+    Color::srgb_u8(222, 210, 184)
 }
-fn amber() -> Color {
-    Color::srgb_u8(255, 188, 93)
+pub(crate) fn amber() -> Color {
+    Color::srgb_u8(255, 194, 95)
 }
 
 #[derive(Component, Clone, Copy)]
@@ -47,11 +49,9 @@ pub(crate) enum HudLayer {
     Lobby,
 }
 #[derive(Component)]
-pub struct Reticle;
-#[derive(Component)]
 pub struct Impact;
 
-fn text(label: &str, size: f32, color: Color) -> impl Bundle {
+pub(crate) fn text(label: &str, size: f32, color: Color) -> impl Bundle {
     (
         Text::new(label),
         TextFont {
@@ -84,7 +84,7 @@ fn spawn_local_lobby(commands: &mut Commands) {
                 justify_content: JustifyContent::Center,
                 ..default()
             },
-            ZIndex(12),
+            GlobalZIndex(12),
             BackgroundColor(Color::srgba(0.025, 0.045, 0.05, 0.34)),
         ))
         .with_children(|screen| {
@@ -100,7 +100,7 @@ fn spawn_local_lobby(commands: &mut Commands) {
                         ..default()
                     },
                     BorderColor(amber()),
-                    BackgroundColor(Color::srgb_u8(24, 35, 37)),
+                    BackgroundColor(ink()),
                 ))
                 .with_children(|panel| {
                     panel.spawn(text("Play bot deathmatch", 29., Color::WHITE));
@@ -122,20 +122,33 @@ fn spawn_local_lobby(commands: &mut Commands) {
                     }
                     panel.spawn((text("", 16., ash()), Field::LobbyControls));
                     panel
-                        .spawn((
-                            Node {
-                                align_self: AlignSelf::FlexStart,
-                                margin: UiRect::top(Val::Px(5.)),
-                                padding: UiRect::axes(Val::Px(16.), Val::Px(8.)),
-                                ..default()
-                            },
-                            BackgroundColor(amber()),
-                        ))
-                        .with_children(|button| {
-                            button.spawn((
-                                text("", 17., Color::srgb_u8(24, 33, 32)),
-                                Field::LobbyAction,
-                            ));
+                        .spawn(Node {
+                            justify_content: JustifyContent::SpaceBetween,
+                            column_gap: Val::Px(12.),
+                            margin: UiRect::top(Val::Px(5.)),
+                            ..default()
+                        })
+                        .with_children(|actions| {
+                            actions
+                                .spawn((
+                                    Node {
+                                        align_items: AlignItems::Center,
+                                        padding: UiRect::axes(Val::Px(16.), Val::Px(8.)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(amber()),
+                                ))
+                                .with_children(|button| {
+                                    button.spawn((
+                                        text("", 18., Color::srgb_u8(32, 30, 22)),
+                                        Field::LobbyAction,
+                                    ));
+                                });
+                            crate::menu::button(
+                                actions,
+                                crate::menu::Choice::LobbyQuit,
+                                "Q   Quit",
+                            );
                         });
                 });
         });
@@ -145,6 +158,7 @@ pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     commands
         .spawn((
@@ -209,7 +223,7 @@ pub fn setup(
         ))
         .with_children(|row| {
             row.spawn((text("HP", 15., ash()), Field::VitalLabel));
-            row.spawn((text("-", 33., Color::WHITE), Field::Health));
+            row.spawn((text("-", 33., amber()), Field::Health));
             row.spawn((text("", 14., ash()), Field::Armor));
             row.spawn((text("", 15., amber()), Field::Cash));
         });
@@ -225,57 +239,15 @@ pub fn setup(
             BackgroundColor(ink()),
         ))
         .with_children(|row| {
-            row.spawn((text("RIFLE", 14., ash()), Field::Rifle));
-            row.spawn((text("-", 33., Color::WHITE), Field::Ammo));
+            row.spawn((text("", 15., ash()), Field::Rifle));
+            row.spawn((text("-", 32., amber()), Field::Ammo));
         });
 
-    // Reticle center is empty and the halo stays legible on walls and uniforms.
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                width: Val::Percent(100.),
-                height: Val::Percent(100.),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-            Reticle,
-        ))
-        .with_children(|center| {
-            center
-                .spawn(Node {
-                    width: Val::Px(19.),
-                    height: Val::Px(19.),
-                    ..default()
-                })
-                .with_children(|cross| {
-                    for (x, y, w, h) in [
-                        (8., 0., 3., 6.),
-                        (8., 13., 3., 6.),
-                        (0., 8., 6., 3.),
-                        (13., 8., 6., 3.),
-                    ] {
-                        cross.spawn((
-                            Node {
-                                position_type: PositionType::Absolute,
-                                left: Val::Px(x),
-                                top: Val::Px(y),
-                                width: Val::Px(w),
-                                height: Val::Px(h),
-                                border: UiRect::all(Val::Px(1.)),
-                                ..default()
-                            },
-                            BackgroundColor(Color::srgb_u8(245, 255, 232)),
-                            BorderColor(Color::srgb_u8(35, 49, 46)),
-                        ));
-                    }
-                });
-        });
+    combat::spawn(&mut commands, &mut images);
+    arsenal::spawn(&mut commands);
     for (top, kind, size, color) in [
         (57., Field::Action, 16., amber()),
         (63., Field::Status, 20., Color::WHITE),
-        (91., Field::Hints, 14., ash()),
     ] {
         commands
             .spawn(Node {
@@ -289,6 +261,17 @@ pub fn setup(
                 row.spawn((text("", size, color), kind, BackgroundColor(ink())));
             });
     }
+    commands.spawn((
+        text("", 13., ash()),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(24.),
+            top: Val::Px(66.),
+            ..default()
+        },
+        Field::Hints,
+        BackgroundColor(ink()),
+    ));
     commands.spawn((
         text("", 15., Color::WHITE),
         Node {
@@ -362,7 +345,7 @@ pub fn update(
     mut fields: Query<(&Field, &mut Text, &mut TextFont)>,
     mut layers: Query<(&HudLayer, &mut Node)>,
     mut impact: Query<(&mut Transform, &mut Visibility), With<Impact>>,
-    mut reticle: Query<&mut Visibility, (With<Reticle>, Without<Impact>)>,
+    menu: Res<crate::menu::MenuState>,
     mut last: Local<Option<Instant>>,
     mut return_notice: Local<ReturnNotice>,
 ) {
@@ -371,30 +354,15 @@ pub fn update(
     let back_in_play =
         return_notice.observe(me.filter(|_| s.mode == Mode::Deathmatch), Instant::now());
     for (layer, mut node) in &mut layers {
-        let shown = matches!(layer, HudLayer::Lobby) == lobby;
+        let shown = !menu.open && matches!(layer, HudLayer::Lobby) == lobby;
         let display = if shown { Display::Flex } else { Display::None };
         if node.display != display {
             node.display = display;
         }
     }
-    if let Ok(mut v) = reticle.get_single_mut() {
-        v.set_if_neq(if !lobby && me.is_some_and(|p| p.hp > 0) {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        });
-    }
     if let Ok((mut transform, mut visibility)) = impact.get_single_mut() {
-        let shot = if s.show_debug {
-            me.and_then(|p| p.shot).or(s.local_shot)
-        } else {
-            s.local_shot
-        };
-        if let Some(shot) = shot.filter(|_| {
-            s.show_debug
-                || s.local_shot_time
-                    .is_some_and(|t| t.elapsed().as_millis() < 150)
-        }) {
+        let shot = me.and_then(|p| p.shot).or(s.local_shot);
+        if let Some(shot) = shot.filter(|_| s.show_debug && !menu.open && !lobby) {
             let distance = s.map.ray_distance(shot.origin, shot.direction, 120.);
             if distance < 120. {
                 transform.translation = shot.origin + shot.direction * (distance - 0.04).max(0.);
@@ -406,7 +374,7 @@ pub fn update(
             visibility.set_if_neq(Visibility::Hidden);
         }
     }
-    if last.is_some_and(|i| i.elapsed() < Duration::from_millis(60)) {
+    if !menu.is_changed() && last.is_some_and(|i| i.elapsed() < Duration::from_millis(60)) {
         return;
     }
     *last = Some(Instant::now());
@@ -423,17 +391,8 @@ pub fn update(
     };
     for (field, mut label, mut font) in &mut fields {
         let deathmatch = s.mode == Mode::Deathmatch;
-        let size = match field {
-            Field::Action => Some(if deathmatch { 21. } else { 16. }),
-            Field::Round => Some(if deathmatch { 21. } else { 18. }),
-            _ => None,
-        };
-        if let Some(size) = size {
-            if font.font_size != size {
-                font.font_size = size;
-            }
-        }
         let value = match field {
+            _ if menu.open => String::new(),
             Field::LobbyBots if lobby => format!(
                 "{} {}",
                 opts.bots,
@@ -442,7 +401,7 @@ pub fn update(
             Field::LobbySkill if lobby => format!("Skill {:.0}%", opts.bot_skill * 100.),
             Field::LobbyControls if lobby => {
                 if s.status.is_empty() {
-                    "WASD move   /   Mouse aim\nLeft click fire   /   R reload".into()
+                    "WASD move    Mouse aim\nLeft click fire    Right click scope\n1-6 weapons    R reload".into()
                 } else {
                     s.status.clone()
                 }
@@ -522,25 +481,35 @@ pub fn update(
             }
             Field::Ammo if s.mode == Mode::Surf => format!("{:.1} m/s", s.body.vel.length()),
             Field::Ammo => {
-                if me.is_some_and(|p| p.armed && p.hp > 0) {
-                    if s.mode == Mode::Competitive {
-                        format!("{:02}/{:02}", s.rifle.ammo, s.rifle.magazine)
+                let viewed = s
+                    .spectate
+                    .and_then(|id| s.players.iter().find(|p| p.id == id))
+                    .or(me);
+                if viewed.is_some_and(|p| p.hp > 0) {
+                    let rifle = s.view_rifle();
+                    if rifle.weapon == sendit_sim::Weapon::Knife {
+                        String::new()
                     } else {
-                        format!("{:02}", s.rifle.ammo)
+                        format!("{:02}/{:02}", rifle.ammo, rifle.magazine)
                     }
                 } else {
                     "-".into()
                 }
             }
             Field::Rifle if s.mode == Mode::Surf => "SPEED".into(),
-            Field::Rifle => if s.rifle.reload_left > 0 {
-                "RELOADING"
-            } else if me.is_some_and(|p| !p.armed) {
-                "UNARMED"
-            } else {
-                "RIFLE"
+            Field::Rifle => {
+                let rifle = s.view_rifle();
+                let name = rifle.weapon.label().to_uppercase();
+                if rifle.reload_left > 0 {
+                    format!("{name}\nRELOADING")
+                } else if rifle.switch_left > 0 {
+                    format!("{name}\nDRAWING")
+                } else if rifle.weapon != sendit_sim::Weapon::Knife {
+                    format!("{name}\nMAGAZINE")
+                } else {
+                    format!("{name}\nMELEE")
+                }
             }
-            .into(),
             Field::Round if s.mode == Mode::Deathmatch => me.map_or_else(String::new, |p| {
                 format!(
                     "   {} {}   ",
@@ -579,11 +548,15 @@ pub fn update(
                     .is_some_and(|t| t.elapsed() < Duration::from_millis(1050));
                 let damaged = s
                     .damage_at
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(450));
-                me.map_or("", |p| {
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(650));
+                let notice = me.map_or("", |p| {
                     deathmatch_notice(p.hp, p.kills, killed, damaged, back_in_play)
-                })
-                .into()
+                });
+                if notice.is_empty() {
+                    nearby_fire_notice(&s).into()
+                } else {
+                    notice.into()
+                }
             }
             Field::Action if s.mode == Mode::Surf => course.1.clone(),
             Field::Action => {
@@ -599,13 +572,18 @@ pub fn update(
                     "   Elimination   ".into()
                 } else if s
                     .damage_at
-                    .is_some_and(|i| i.elapsed().as_secs_f32() < 0.45)
+                    .is_some_and(|i| i.elapsed() < Duration::from_millis(650))
                 {
                     "   Hit   ".into()
                 } else if s.mode == Mode::Competitive {
-                    objective(&s)
+                    let prompt = objective(&s);
+                    if prompt.is_empty() {
+                        nearby_fire_notice(&s).into()
+                    } else {
+                        prompt
+                    }
                 } else {
-                    String::new()
+                    nearby_fire_notice(&s).into()
                 }
             }
             Field::Status => {
@@ -623,14 +601,14 @@ pub fn update(
                 }
             }
             Field::Hints => {
-                if s.show_help || s.scoreboard {
+                if s.show_help || s.show_debug || s.scoreboard {
                     String::new()
                 } else if s.mode == Mode::Surf {
-                    "   F1  Controls     F5  Restart run   ".into()
+                    "  Esc Menu    F5 Restart run  ".into()
                 } else if s.mode == Mode::Practice {
-                    "   F1  Controls     F3  Telemetry     F5  Reset   ".into()
+                    "  Esc Menu    F5 Reset  ".into()
                 } else {
-                    "   Tab  Scoreboard     F1  Controls   ".into()
+                    "  Esc Menu  ".into()
                 }
             }
             Field::Stats => {
@@ -646,7 +624,10 @@ pub fn update(
    WASD   Move          Mouse   Aim
    LMB     Fire              R            Reload
    Space  Jump            Tab       Hold for scores
-   Esc       Release mouse
+   1 Knife       2 Pistol       3 M4
+   4 AK           5 .50 Sniper  6 SMG
+   RMB     Sniper scope
+   Esc       Game menu
    F3         Shot telemetry
 
    F1         Close   "
@@ -654,15 +635,39 @@ pub fn update(
             }
             Field::Help => {
                 if s.show_help && !s.scoreboard {
-                    "   CONTROLS\n\n   WASD     Move             Mouse     Aim\n   Space     Jump             LMB         Fire\n   R             Reload          Esc           Release mouse\n   E             Plant / defuse (hold) or recover\n   G             Drop bomb    B              Buy rifle\n   Tab         Hold for scores, tap to cycle spectator\n   F3           Shot telemetry\n   F5           Reset practice or surf\n\n   F1           Close   ".into()
+                    "   CONTROLS\n\n   WASD     Move             Mouse     Aim\n   Space     Jump             LMB         Fire\n   R             Reload          Esc           Game menu\n   1 Knife        2 Pistol        3 M4\n   4 AK            5 .50 Sniper   6 SMG\n   RMB        Sniper scope\n   E             Plant / defuse (hold) or recover\n   G             Drop bomb    B              Buy weapon kit\n   Tab         Hold for scores, tap to cycle spectator\n   F3           Shot telemetry\n   F5           Reset practice or surf\n\n   F1           Close   ".into()
                 } else {
                     String::new()
                 }
             }
         };
+        let size = match field {
+            Field::Action if value == NEARBY_FIRE => Some(14.),
+            Field::Action => Some(if deathmatch { 21. } else { 16. }),
+            Field::Round => Some(if deathmatch { 21. } else { 18. }),
+            _ => None,
+        };
+        if let Some(size) = size {
+            if font.font_size != size {
+                font.font_size = size;
+            }
+        }
         if **label != value {
             **label = value;
         }
+    }
+}
+
+const NEARBY_FIRE: &str = "   Nearby enemy fire   ";
+
+fn nearby_fire_notice(session: &Session) -> &'static str {
+    if session
+        .nearby_fire
+        .is_some_and(|(at, _)| at.elapsed() < Duration::from_millis(360))
+    {
+        NEARBY_FIRE
+    } else {
+        ""
     }
 }
 
@@ -736,18 +741,16 @@ fn objective(s: &Session) -> String {
         return "   Warmup   /   Waiting for both teams   ".into();
     }
     if r.phase == Phase::Buy {
-        if p.rifle.magazine == sendit_sim::rifle::MAGAZINE
-            && p.armor == sendit_sim::Loadout::Armored.armor()
-        {
-            return "   Rifle kit equipped   ".into();
+        if p.rifle.owns(sendit_sim::Weapon::Ak) && p.armor == sendit_sim::Loadout::Armored.armor() {
+            return "   Full weapon kit equipped   ".into();
         }
         if p.money < KIT_COST {
             return format!(
-                "   Rifle kit  ${KIT_COST}   /   Need ${}   ",
+                "   Full weapon kit  ${KIT_COST}   /   Need ${}   ",
                 KIT_COST - p.money
             );
         }
-        return format!("   B   Buy rifle kit + 50 armor   ${KIT_COST}   ");
+        return format!("   B   Buy full weapon kit + 50 armor   ${KIT_COST}   ");
     }
     if r.action_by == Some(p.id) && r.progress > 0. {
         let verb = if r.phase == Phase::Planted {

@@ -1,112 +1,17 @@
-//! Build render meshes directly from the collision solids. One static draw group per material.
+//! First-person presentation and interpolated world actors.
+mod effects;
+mod environment;
+mod models;
+
+pub(crate) use effects::combat_effects;
+pub(crate) use environment::{setup as setup_environment, sync_map};
+
 use crate::game::Session;
-use bevy::{
-    core_pipeline::tonemapping::Tonemapping,
-    prelude::*,
-    render::{mesh::PrimitiveTopology, render_asset::RenderAssetUsages},
-};
-use sendit_sim::{map::Material, motion::EYE_HEIGHT, BombView};
+use bevy::{core_pipeline::tonemapping::Tonemapping, prelude::*};
+use models::{Uniform, WeaponArt};
+use sendit_sim::{motion::EYE_HEIGHT, BombView, Mode, Weapon};
 use std::collections::HashMap;
 
-const PALETTE: [[u8; 3]; 9] = [
-    [107, 124, 124],
-    [210, 207, 190],
-    [58, 79, 82],
-    [233, 156, 64],
-    [203, 69, 46],
-    [135, 159, 156],
-    [157, 162, 151],
-    [211, 109, 59],
-    [83, 150, 174],
-];
-fn slot(material: Material) -> usize {
-    match material {
-        Material::Floor => 0,
-        Material::Wall => 1,
-        Material::Cover => 2,
-        Material::Trim => 3,
-        Material::Target => 4,
-        Material::Ramp => 5,
-        Material::Step => 6,
-        Material::SiteA => 7,
-        Material::SiteB => 8,
-    }
-}
-
-#[derive(Default, Clone)]
-struct Batch {
-    vertices: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-}
-impl Batch {
-    fn face(&mut self, a: Vec3, b: Vec3, c: Vec3) {
-        let normal = (b - a).cross(c - a);
-        if normal.length_squared() < 1e-15 {
-            return;
-        }
-        self.vertices
-            .extend([a.to_array(), b.to_array(), c.to_array()]);
-        self.normals.extend([normal.normalize().to_array(); 3]);
-    }
-    fn prism(&mut self, min: Vec3, max: Vec3, height: impl Fn(f32, f32) -> f32) {
-        let bottom = [
-            Vec3::new(min.x, min.y, min.z),
-            Vec3::new(min.x, min.y, max.z),
-            Vec3::new(max.x, min.y, max.z),
-            Vec3::new(max.x, min.y, min.z),
-        ];
-        let top = bottom.map(|p| p.with_y(height(p.x, p.z)));
-        self.face(top[0], top[1], top[2]);
-        self.face(top[0], top[2], top[3]);
-        self.face(bottom[0], bottom[2], bottom[1]);
-        self.face(bottom[0], bottom[3], bottom[2]);
-        for i in 0..4 {
-            let j = (i + 1) % 4;
-            self.face(bottom[i], bottom[j], top[j]);
-            self.face(bottom[i], top[j], top[i]);
-        }
-    }
-    fn block(&mut self, center: [f32; 3], size: [f32; 3]) {
-        let c = Vec3::from(center);
-        let half = Vec3::from(size) * 0.5;
-        self.prism(c - half, c + half, |_, _| c.y + half.y);
-    }
-    fn floor_stripe(&mut self, x: f32, z: f32, width: f32, length: f32) {
-        let corner = |dx: f32, dz: f32| Vec3::new(x + dx * width, 0.008, z + dz * length);
-        let [a, b, c, d] = [
-            corner(-0.5, -0.5),
-            corner(-0.5, 0.5),
-            corner(0.5, 0.5),
-            corner(0.5, -0.5),
-        ];
-        self.face(a, b, c);
-        self.face(a, c, d);
-    }
-    // Painted sidelines and distance marks give strafing players a reference on the training court.
-    fn aim_markings(&mut self) {
-        for side in [-1., 1.] {
-            self.floor_stripe(side * 12.5, 0., 0.13, 23.);
-            self.floor_stripe(0., side * 11.5, 25.13, 0.13);
-            for z in [-9., -6., -3., 0., 3., 6., 9.] {
-                self.floor_stripe(side * 12.02, z, 0.82, 0.13);
-            }
-            for x in [3.6, 5.5, 7.4, 9.3, 11.2] {
-                self.floor_stripe(side * x, 0., 0.9, 0.15);
-            }
-        }
-    }
-    fn mesh(self) -> Mesh {
-        Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::RENDER_WORLD,
-        )
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.vertices)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
-    }
-}
-
-#[derive(Component)]
-pub struct Geometry;
 #[derive(Component)]
 pub struct Eye;
 #[derive(Component)]
@@ -114,86 +19,42 @@ pub struct ViewModel;
 #[derive(Component)]
 pub struct Remote;
 #[derive(Component)]
-pub struct WornGear(u16);
-#[derive(Component)]
 pub struct Objective;
+#[derive(Component)]
+pub enum HeldPart {
+    Body,
+    Magazine,
+    Flash,
+}
+#[derive(Component)]
+pub enum Joint {
+    Leg(u16, f32),
+    Hand(u16),
+}
 #[derive(Resource)]
 pub struct SceneAssets {
-    palette: Vec<Handle<StandardMaterial>>,
-    uniform: [Handle<StandardMaterial>; 2],
-    dark: Handle<StandardMaterial>,
-    suit: Handle<Mesh>,
-    gear: Handle<Mesh>,
-    unarmed_gear: Handle<Mesh>,
-}
-
-fn material(materials: &mut Assets<StandardMaterial>, rgb: [u8; 3]) -> Handle<StandardMaterial> {
-    materials.add(StandardMaterial {
-        base_color: Color::srgb_u8(rgb[0], rgb[1], rgb[2]),
-        perceptual_roughness: 0.92,
-        reflectance: 0.12,
-        ..default()
-    })
+    weapons: [WeaponArt; 6],
+    uniforms: [Uniform; 2],
+    paint: Handle<StandardMaterial>,
+    effects: effects::EffectAssets,
 }
 
 pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
-    let palette = PALETTE.map(|rgb| material(&mut mats, rgb)).to_vec();
-    // Shoulder colors remain readable against the pale concrete and against each other.
-    let uniform = [[183, 84, 44], [41, 102, 150]].map(|rgb| {
-        let dye = Color::srgb_u8(rgb[0], rgb[1], rgb[2]);
-        // A small, fixed color contribution keeps team silhouettes readable in unlit corners.
-        mats.add(StandardMaterial {
-            base_color: dye,
-            emissive: dye.to_linear() * 0.36,
-            perceptual_roughness: 0.92,
-            reflectance: 0.12,
-            ..default()
-        })
+    let weapons = Weapon::ALL.map(|weapon| WeaponArt::new(weapon, &mut meshes));
+    let uniforms = [false, true].map(|blue| Uniform::new(blue, &mut meshes));
+    let paint = mats.add(StandardMaterial {
+        base_color_texture: Some(images.add(models::surface_paint())),
+        perceptual_roughness: 0.91,
+        reflectance: 0.14,
+        ..default()
     });
-    let dark = material(&mut mats, [34, 46, 49]);
-    let mut suit = Batch::default();
-    let mut gear = Batch::default();
-    suit.block([0., 1.07, 0.], [0.44, 0.56, 0.30]);
-    suit.block([0., 1.57, 0.], [0.30, 0.31, 0.31]);
-    for side in [-1., 1.] {
-        suit.block([side * 0.25, 1.18, -0.045], [0.145, 0.26, 0.20]);
-        gear.block([side * 0.24, 1.05, -0.14], [0.14, 0.13, 0.33]);
-        suit.block([side * 0.12, 0.47, 0.], [0.19, 0.67, 0.22]);
-        gear.block([side * 0.12, 0.095, -0.05], [0.20, 0.19, 0.32]);
-    }
-    gear.block([0., 0.79, 0.], [0.42, 0.13, 0.32]);
-    gear.block([0., 1.55, -0.161], [0.26, 0.072, 0.025]);
-    let unarmed_gear = meshes.add(gear.clone().mesh());
-    gear.block([0.145, 1.16, -0.34], [0.075, 0.125, 0.55]);
-    gear.block([0.145, 1.16, -0.66], [0.035, 0.035, 0.16]);
-
-    // The viewmodel fits between the near plane and the player's collision radius;
-    // the crosshair remains clear even against a wall.
-    let mut receiver = Batch::default();
-    let mut stock = Batch::default();
-    let mut brass = Batch::default();
-    receiver.block([0.092, -0.076, -0.162], [0.039, 0.042, 0.108]);
-    receiver.block([0.086, -0.060, -0.220], [0.030, 0.028, 0.057]);
-    receiver.block([0.084, -0.060, -0.265], [0.014, 0.014, 0.044]);
-    receiver.block([0.086, -0.041, -0.240], [0.004, 0.017, 0.007]);
-    stock.block([0.107, -0.092, -0.092], [0.050, 0.051, 0.060]);
-    stock.block([0.093, -0.104, -0.172], [0.022, 0.044, 0.038]);
-    for i in 0..4 {
-        receiver.block(
-            [0.087, -0.044, -0.190 - i as f32 * 0.011],
-            [0.029, 0.005, 0.004],
-        );
-    }
-    brass.block([0.112, -0.071, -0.157], [0.002, 0.010, 0.025]);
-    let gun = [
-        (receiver.mesh(), dark.clone()),
-        (stock.mesh(), palette[2].clone()),
-        (brass.mesh(), palette[3].clone()),
-    ];
+    let effects = effects::EffectAssets::new(&mut meshes, &mut mats);
+    let initial = &weapons[Weapon::M4.index()];
     commands
         .spawn((
             Camera3d::default(),
@@ -211,11 +72,24 @@ pub fn setup(
         ))
         .with_children(|camera| {
             camera
-                .spawn((ViewModel, Transform::default(), Visibility::default()))
-                .with_children(|gun_root| {
-                    for (mesh, mat) in gun {
-                        gun_root.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat)));
-                    }
+                .spawn((ViewModel, Transform::default(), Visibility::Hidden))
+                .with_children(|root| {
+                    root.spawn((
+                        HeldPart::Body,
+                        Mesh3d(initial.first_person.clone()),
+                        MeshMaterial3d(paint.clone()),
+                    ));
+                    root.spawn((
+                        HeldPart::Magazine,
+                        Mesh3d(initial.feed.clone().unwrap_or_default()),
+                        MeshMaterial3d(paint.clone()),
+                    ));
+                    root.spawn((
+                        HeldPart::Flash,
+                        Mesh3d(effects.flash.clone()),
+                        MeshMaterial3d(effects.flame.clone()),
+                        Visibility::Hidden,
+                    ));
                 });
         });
     commands.spawn((
@@ -226,76 +100,49 @@ pub fn setup(
         },
         Transform::from_xyz(-4., 9., 5.).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-    // The C4 carrier is shown on the HUD. A dropped or planted pack also has a world-space silhouette.
-    let mut pack = Batch::default();
-    pack.block([0., 0.10, 0.], [0.36, 0.20, 0.28]);
-    commands.spawn((
-        Mesh3d(meshes.add(pack.mesh())),
-        MeshMaterial3d(palette[3].clone()),
-        Objective,
-        Visibility::Hidden,
-    ));
+    let pack = mats.add(Color::srgb_u8(161, 123, 54));
+    let band = mats.add(Color::srgb_u8(55, 56, 47));
+    commands
+        .spawn((Objective, Transform::default(), Visibility::Hidden))
+        .with_children(|root| {
+            root.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.36, 0.20, 0.28))),
+                MeshMaterial3d(pack),
+                Transform::from_xyz(0., 0.10, 0.),
+            ));
+            let strap = meshes.add(Cuboid::new(0.032, 0.204, 0.284));
+            for x in [-0.103, 0.103] {
+                root.spawn((
+                    Mesh3d(strap.clone()),
+                    MeshMaterial3d(band.clone()),
+                    Transform::from_xyz(x, 0.102, 0.),
+                ));
+            }
+        });
     commands.insert_resource(SceneAssets {
-        palette,
-        uniform,
-        dark,
-        suit: meshes.add(suit.mesh()),
-        gear: meshes.add(gear.mesh()),
-        unarmed_gear,
+        weapons,
+        uniforms,
+        paint,
+        effects,
     });
 }
 
-pub fn sync_map(
-    mut commands: Commands,
-    s: Res<Session>,
-    assets: Res<SceneAssets>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    old: Query<Entity, With<Geometry>>,
-    mut generation: Local<u64>,
-) {
-    if *generation == s.map_revision {
-        return;
-    }
-    for entity in &old {
-        commands.entity(entity).despawn();
-    }
-    let mut parts: [Batch; 9] = Default::default();
-    for b in &s.map.boxes {
-        parts[slot(b.material)].prism(b.min, b.max, |_, _| b.max.y);
-    }
-    for r in &s.map.ramps {
-        parts[slot(r.material)].prism(r.min, r.max, |x, z| r.height_at(x, z));
-    }
-    if s.map.name == "aim" {
-        parts[slot(Material::Step)].aim_markings();
-    }
-    for (index, batch) in parts.into_iter().enumerate() {
-        if !batch.vertices.is_empty() {
-            commands.spawn((
-                Mesh3d(meshes.add(batch.mesh())),
-                MeshMaterial3d(assets.palette[index].clone()),
-                Geometry,
-            ));
-        }
-    }
-    *generation = s.map_revision;
+fn blue_uniform(mode: Mode, team: u8) -> usize {
+    usize::from(mode != Mode::Deathmatch && team != 0)
 }
 
 pub fn sync_players(
     mut commands: Commands,
     s: Res<Session>,
     assets: Res<SceneAssets>,
-    mut positions: Query<
-        (
-            &mut Transform,
-            &mut Visibility,
-            &mut MeshMaterial3d<StandardMaterial>,
-        ),
-        With<Remote>,
+    time: Res<Time>,
+    mut roots: Query<(&mut Transform, &mut Visibility, &mut Mesh3d), With<Remote>>,
+    mut joints: Query<(&Joint, &mut Transform, &mut Visibility, &mut Mesh3d), Without<Remote>>,
+    mut objectives: Query<
+        (&mut Transform, &mut Visibility),
+        (With<Objective>, Without<Remote>, Without<Joint>),
     >,
-    mut equipment: Query<(&WornGear, &mut Mesh3d)>,
     mut entities: Local<HashMap<u16, Entity>>,
-    mut objectives: Query<(&mut Transform, &mut Visibility), (With<Objective>, Without<Remote>)>,
 ) {
     entities.retain(|id, entity| {
         let keep = s.players.iter().any(|p| p.id == *id && Some(p.id) != s.id);
@@ -304,62 +151,89 @@ pub fn sync_players(
         }
         keep
     });
-    for (gear, mut mesh) in &mut equipment {
-        let armed =
-            s.mode != sendit_sim::Mode::Surf && s.players.iter().any(|p| p.id == gear.0 && p.armed);
-        let source = if armed {
-            &assets.gear
-        } else {
-            &assets.unarmed_gear
-        };
-        if mesh.0 != *source {
-            mesh.0 = source.clone();
-        }
-    }
+    let waiting =
+        s.mode == Mode::Competitive && s.spectate.is_none() && s.me().is_some_and(|p| p.hp == 0);
     for p in s.players.iter().filter(|v| Some(v.id) != s.id) {
         let (pos, yaw) = s.remote_pose(p);
         let transform = Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(-yaw));
-        let team_spectator_waiting = s.mode == sendit_sim::Mode::Competitive
-            && s.spectate.is_none()
-            && s.me().is_some_and(|me| me.hp == 0);
-        let visibility = if p.hp == 0 || s.spectate == Some(p.id) || team_spectator_waiting {
+        let visibility = if p.hp == 0 || s.spectate == Some(p.id) || waiting {
             Visibility::Hidden
         } else {
             Visibility::Inherited
         };
-        // Every other player is a rival in free-for-all, even across the two spawn groups.
-        let blue = s.mode != sendit_sim::Mode::Deathmatch && p.team != 0;
-        let paint = assets.uniform[usize::from(blue)].clone();
+        let uniform = &assets.uniforms[blue_uniform(s.mode, p.team)];
+        let carried = &assets.weapons[p.rifle.weapon.index()].carried;
         if let Some(entity) = entities.get(&p.id) {
-            if let Ok((mut t, mut v, mut m)) = positions.get_mut(*entity) {
+            if let Ok((mut t, mut v, mut mesh)) = roots.get_mut(*entity) {
                 *t = transform;
                 v.set_if_neq(visibility);
-                if m.0 != paint {
-                    m.0 = paint;
-                }
+                mesh.set_if_neq(Mesh3d(uniform.torso.clone()));
             }
         } else {
             let entity = commands
                 .spawn((
-                    Mesh3d(assets.suit.clone()),
-                    MeshMaterial3d(paint),
+                    Remote,
+                    Mesh3d(uniform.torso.clone()),
+                    MeshMaterial3d(assets.paint.clone()),
                     transform,
                     visibility,
-                    Remote,
                 ))
                 .with_children(|root| {
+                    for side in [-1., 1.] {
+                        root.spawn((
+                            Joint::Leg(p.id, side),
+                            Mesh3d(uniform.leg.clone()),
+                            MeshMaterial3d(assets.paint.clone()),
+                            Transform::from_xyz(side * 0.105, 0.829, 0.),
+                        ));
+                    }
                     root.spawn((
-                        WornGear(p.id),
-                        Mesh3d(if s.mode != sendit_sim::Mode::Surf && p.armed {
-                            assets.gear.clone()
+                        Joint::Hand(p.id),
+                        Mesh3d(carried.clone()),
+                        MeshMaterial3d(assets.paint.clone()),
+                        Transform::from_xyz(0.128, 1.245, -0.18).with_scale(Vec3::splat(0.81)),
+                        if p.armed && s.mode != Mode::Surf {
+                            Visibility::Inherited
                         } else {
-                            assets.unarmed_gear.clone()
-                        }),
-                        MeshMaterial3d(assets.dark.clone()),
+                            Visibility::Hidden
+                        },
                     ));
                 })
                 .id();
             entities.insert(p.id, entity);
+        }
+    }
+    for (joint, mut t, mut visible, mut mesh) in &mut joints {
+        let id = match *joint {
+            Joint::Leg(id, _) | Joint::Hand(id) => id,
+        };
+        let Some(p) = s.players.iter().find(|p| p.id == id) else {
+            continue;
+        };
+        match *joint {
+            Joint::Leg(_, side) => {
+                let uniform = &assets.uniforms[blue_uniform(s.mode, p.team)];
+                mesh.set_if_neq(Mesh3d(uniform.leg.clone()));
+                let stride = if p.body.grounded {
+                    (p.body.vel.xz().length() * 0.14).min(0.76)
+                } else {
+                    0.14
+                };
+                t.rotation = Quat::from_rotation_x(
+                    side * stride * (time.elapsed_secs() * 9.8 + id as f32).sin(),
+                );
+            }
+            Joint::Hand(_) => {
+                visible.set_if_neq(if p.armed && s.mode != Mode::Surf {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                });
+                mesh.set_if_neq(Mesh3d(
+                    assets.weapons[p.rifle.weapon.index()].carried.clone(),
+                ));
+                t.rotation = Quat::from_rotation_x(p.pitch.clamp(-0.95, 1.05) * 0.8);
+            }
         }
     }
     if let Ok((mut transform, mut visibility)) = objectives.get_single_mut() {
@@ -369,19 +243,18 @@ pub fn sync_players(
         });
         if let Some(pos) = position {
             transform.translation = pos;
-            *visibility = Visibility::Inherited;
+            visibility.set_if_neq(Visibility::Inherited);
         } else {
-            *visibility = Visibility::Hidden;
+            visibility.set_if_neq(Visibility::Hidden);
         }
     }
 }
 
 pub fn place_camera(
     s: Res<Session>,
-    mut cameras: Query<&mut Transform, With<Eye>>,
-    mut guns: Query<&mut Visibility, With<ViewModel>>,
+    mut cameras: Query<(&mut Transform, &mut Projection), With<Eye>>,
 ) {
-    let Ok(mut camera) = cameras.get_single_mut() else {
+    let Ok((mut camera, mut lens)) = cameras.get_single_mut() else {
         return;
     };
     let mut pos = s.body.pos;
@@ -398,27 +271,155 @@ pub fn place_camera(
         yaw = me.yaw;
         pitch = me.pitch;
     } else {
-        // Extrapolate at most one tick, then clip the visual offset against the map.
-        // The fixed-tick body used by prediction and hit registration is never shifted.
+        // Clip the visual extrapolation to one unobstructed simulation tick.
         let offset = s.body.vel * s.accumulator;
-        if offset.length_squared() > 0. {
-            let distance = s.map.ray_distance(
-                pos + Vec3::Y * EYE_HEIGHT,
-                offset.normalize(),
-                offset.length(),
-            );
-            pos += offset.normalize() * distance;
+        if let Some(dir) = offset.try_normalize() {
+            pos += dir
+                * s.map
+                    .ray_distance(pos + Vec3::Y * EYE_HEIGHT, dir, offset.length());
         }
     }
     camera.translation = pos + Vec3::Y * EYE_HEIGHT;
     camera.rotation = Quat::from_euler(EulerRot::YXZ, -yaw, pitch, 0.);
-    if let Ok(mut visibility) = guns.get_single_mut() {
-        visibility.set_if_neq(
-            if s.mode != sendit_sim::Mode::Surf && s.me().is_some_and(|p| p.armed && p.hp > 0) {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            },
-        );
+    if let Projection::Perspective(lens) = &mut *lens {
+        lens.fov = if s.scoped() { 27f32 } else { 73f32 }.to_radians();
+    }
+}
+
+#[derive(Default)]
+pub struct WeaponMotion {
+    angles: Option<Vec2>,
+    sway: Vec2,
+    stride: f32,
+    subject: Option<(u16, u32)>,
+}
+
+pub fn present_weapon(
+    s: Res<Session>,
+    assets: Res<SceneAssets>,
+    time: Res<Time>,
+    mut motion: Local<WeaponMotion>,
+    mut roots: Query<(&mut Transform, &mut Visibility), With<ViewModel>>,
+    mut parts: Query<(&HeldPart, &mut Transform, &mut Visibility, &mut Mesh3d), Without<ViewModel>>,
+) {
+    let Ok((mut root, mut visible)) = roots.get_single_mut() else {
+        return;
+    };
+    let id = s.spectate.or(s.id);
+    let Some(subject) = s
+        .players
+        .iter()
+        .find(|p| Some(p.id) == id && p.hp > 0 && p.armed && s.mode != Mode::Surf)
+    else {
+        visible.set_if_neq(Visibility::Hidden);
+        motion.subject = None;
+        return;
+    };
+    visible.set_if_neq(if s.scoped() {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    });
+    let rifle = s.view_rifle();
+    let weapon = rifle.weapon;
+    let art = &assets.weapons[weapon.index()];
+    let dt = time.delta_secs().min(0.05);
+    let own = s.id == Some(subject.id);
+    let angles = if own {
+        Vec2::new(s.input.yaw, s.input.pitch)
+    } else {
+        Vec2::new(subject.yaw, subject.pitch)
+    };
+    if motion.subject != Some((subject.id, subject.life)) {
+        *motion = WeaponMotion {
+            subject: Some((subject.id, subject.life)),
+            ..default()
+        };
+    }
+    let previous = motion.angles.replace(angles).unwrap_or(angles);
+    let yaw_delta = (angles.x - previous.x).sin();
+    let target = (Vec2::new(yaw_delta, angles.y - previous.y) / dt.max(0.001))
+        .clamp(Vec2::splat(-4.), Vec2::splat(4.));
+    motion.sway = motion.sway.lerp(target, 1. - (-dt * 12.).exp());
+    let body = if own { s.body } else { subject.body };
+    let speed = if body.grounded {
+        body.vel.xz().length()
+    } else {
+        0.
+    };
+    motion.stride += dt * speed * 2.35;
+    let bob = Vec2::new(motion.stride.sin(), (motion.stride * 2.).cos()) * (speed * 0.18).min(1.);
+    let shot = s
+        .shot_presentation(subject.id)
+        .filter(|(shot, _)| shot.weapon == weapon);
+    let age = shot.map_or(f32::INFINITY, |(_, at)| at.elapsed().as_secs_f32());
+    let kick = (1. - age / 0.16).clamp(0., 1.).powi(2);
+    let strength = match weapon {
+        Weapon::Knife => 0.,
+        Weapon::Pistol => 0.95,
+        Weapon::M4 => 0.80,
+        Weapon::Ak => 1.18,
+        Weapon::Sniper => 1.52,
+        Weapon::Smg => 0.56,
+    };
+    let slash = if weapon == Weapon::Knife && age < 0.25 {
+        (age / 0.25 * std::f32::consts::PI).sin()
+    } else {
+        0.
+    };
+    let reload = s
+        .reload_fraction(subject.id)
+        .map_or(0., |progress| (progress * std::f32::consts::PI).sin());
+    let draw = f32::from(rifle.switch_left) / f32::from(weapon.spec().draw_ticks.max(1));
+    let lower = reload + draw * 0.9;
+    let size = if weapon == Weapon::Sniper {
+        0.18
+    } else {
+        0.211
+    };
+    root.scale = Vec3::splat(size);
+    root.translation = Vec3::new(
+        0.091 + bob.x * 0.0027 + motion.sway.x * 0.0012 + lower * 0.012 - slash * 0.104,
+        -0.080 + bob.y * 0.0019 - motion.sway.y * 0.0009 - lower * 0.038
+            + slash * 0.018
+            + kick * strength * 0.003,
+        -0.153 + kick * strength * 0.019 + draw * 0.021,
+    );
+    root.rotation = Quat::from_euler(
+        EulerRot::YXZ,
+        0.17 - motion.sway.x * 0.013 + slash * 0.77,
+        0.022 + strength * kick * 0.15 - lower * 0.32,
+        -0.025 + bob.x * 0.012 - reload * 0.40 + slash * 0.62,
+    );
+    for (part, mut transform, mut visibility, mut mesh) in &mut parts {
+        match part {
+            HeldPart::Body => {
+                mesh.set_if_neq(Mesh3d(art.first_person.clone()));
+            }
+            HeldPart::Magazine => {
+                if let Some(feed) = &art.feed {
+                    mesh.set_if_neq(Mesh3d(feed.clone()));
+                    transform.translation =
+                        Vec3::new(-0.103 * reload, -0.22 * reload, 0.06 * reload);
+                    transform.rotation = Quat::from_rotation_z(-0.42 * reload);
+                    visibility.set_if_neq(Visibility::Inherited);
+                } else {
+                    visibility.set_if_neq(Visibility::Hidden);
+                }
+            }
+            HeldPart::Flash => {
+                let lit = weapon != Weapon::Knife && age < 0.070;
+                visibility.set_if_neq(if lit {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                });
+                if let Some((shot, _)) = shot.filter(|_| lit) {
+                    transform.translation = art.tip;
+                    transform.rotation = Quat::from_rotation_z((shot.tick % 13) as f32 * 0.48);
+                    transform.scale = Vec3::splat((0.88 + strength * 0.22) * (1. - age * 6.));
+                }
+            }
+        }
     }
 }

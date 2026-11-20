@@ -5,6 +5,7 @@ mod benchmark;
 mod game;
 mod hud;
 mod map_transfer;
+mod menu;
 mod options;
 mod scene;
 #[cfg(all(windows, not(debug_assertions)))]
@@ -73,19 +74,35 @@ fn main() -> AppExit {
     .insert_resource(audio::Sound::new(!opts.mute && !measuring))
     .insert_resource(opts)
     .insert_resource(session)
-    .add_systems(Startup, (scene::setup, hud::setup, audio::setup))
+    .init_resource::<menu::MenuState>()
+    .add_systems(
+        Startup,
+        (
+            scene::setup,
+            scene::setup_environment,
+            hud::setup,
+            menu::setup,
+            audio::setup,
+        ),
+    )
     .add_systems(
         Update,
         (
             game::receive,
+            menu::input,
             game::sample,
             game::predict,
             scene::sync_map,
             scene::sync_players,
             scene::place_camera,
+            scene::present_weapon,
+            scene::combat_effects,
             hud::scale,
             hud::update,
+            hud::combat::update,
+            hud::arsenal::update,
             hud::scoreboard::update,
+            menu::paint,
             audio::play,
         )
             .chain(),

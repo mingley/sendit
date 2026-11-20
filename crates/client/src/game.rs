@@ -13,7 +13,7 @@ use sendit_sim::{
     motion::{self, DT},
     replay::{Trace, TraceWriter},
     wire::{self, ClientMsg, Command, ServerMsg},
-    Arena, Body, Input, Mode, Phase, PlayerView, Rifle, RoundView, Shot, Tuning,
+    Arena, Body, Input, Mode, Phase, PlayerView, Rifle, RoundView, Shot, Tuning, Weapon,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -31,6 +31,7 @@ pub struct Session {
     pub scene_ready: bool,
     announced_player: bool,
     suppress_fire_until_release: bool,
+    suppress_scope_until_release: bool,
     token: u64,
     epoch_tick: u32,
     epochs: u32,
@@ -60,10 +61,16 @@ pub struct Session {
     pub input: Input,
     tap_fire: bool,
     fire_held: bool,
+    scope_held: bool,
     pub body: Body,
     pub rifle: Rifle,
     pub local_shot: Option<Shot>,
     pub local_shot_time: Option<Instant>,
+    pub confirmed_local_shot: Option<(Shot, Instant)>,
+    pub confirmed_hit_at: Option<Instant>,
+    pub damage_origin: Option<Vec3>,
+    pub nearby_fire: Option<(Instant, Vec3)>,
+    remote_shots: HashMap<u16, (Shot, Instant)>,
     sequence: u32,
     pending: VecDeque<Command>,
     pub accumulator: f32,
@@ -119,6 +126,7 @@ impl Session {
             scene_ready: false,
             announced_player: false,
             suppress_fire_until_release: false,
+            suppress_scope_until_release: false,
             token: 0,
             epoch_tick: 0,
             epochs: 0,
@@ -156,10 +164,16 @@ impl Session {
             input,
             tap_fire: false,
             fire_held: false,
+            scope_held: false,
             body,
             rifle: Rifle::default(),
             local_shot: None,
             local_shot_time: None,
+            confirmed_local_shot: None,
+            confirmed_hit_at: None,
+            damage_origin: None,
+            nearby_fire: None,
+            remote_shots: HashMap::new(),
             sequence: 0,
             pending: VecDeque::with_capacity(128),
             accumulator: 0.,
@@ -289,6 +303,11 @@ impl Session {
         self.rtt_ms = None;
         self.local_shot = None;
         self.local_shot_time = None;
+        self.confirmed_local_shot = None;
+        self.confirmed_hit_at = None;
+        self.damage_origin = None;
+        self.nearby_fire = None;
+        self.remote_shots.clear();
         self.hit_at = None;
         self.damage_at = None;
         self.rejected = false;
@@ -310,6 +329,52 @@ impl Session {
 
     pub fn me(&self) -> Option<&PlayerView> {
         self.players.iter().find(|v| Some(v.id) == self.id)
+    }
+
+    pub fn connection_epoch(&self) -> u32 {
+        self.epochs
+    }
+
+    pub fn view_rifle(&self) -> Rifle {
+        self.players
+            .iter()
+            .find(|p| Some(p.id) == self.spectate && p.hp > 0)
+            .map_or(self.rifle, |p| p.rifle)
+    }
+
+    pub fn weapon(&self) -> Weapon {
+        self.view_rifle().weapon
+    }
+
+    pub fn scoped(&self) -> bool {
+        self.scope_held
+            && self.captured
+            && self.mode != Mode::Surf
+            && self.can_move()
+            && self.me().is_some_and(|p| p.armed)
+            && self.weapon() == Weapon::Sniper
+            && self.rifle.switch_left == 0
+            && self.rifle.reload_left == 0
+    }
+
+    pub fn shot_presentation(&self, id: u16) -> Option<(Shot, Instant)> {
+        if self.id == Some(id) {
+            self.local_shot.zip(self.local_shot_time)
+        } else {
+            self.remote_shots.get(&id).copied()
+        }
+    }
+
+    pub fn reload_fraction(&self, id: u16) -> Option<f32> {
+        let rifle = if Some(id) == self.id {
+            self.rifle
+        } else {
+            self.players.iter().find(|p| p.id == id)?.rifle
+        };
+        (rifle.reload_left > 0).then(|| {
+            let total = rifle.weapon.reload_ticks(&self.tuning).max(1) as f32;
+            (1. - f32::from(rifle.reload_left) / total).clamp(0., 1.)
+        })
     }
 
     fn spawn_pitch(&self) -> f32 {
@@ -398,24 +463,47 @@ impl Session {
         };
     }
 
+    /// Apply one command exactly once to the predicted simulation state. A
+    /// reconciliation replays the same path without reproducing sounds or flashes.
+    fn advance_prediction(&mut self, command: Command, tick: u32, me: PlayerView) -> Option<Shot> {
+        if me.hp == 0 {
+            return None;
+        }
+        let mut input = command.input;
+        if self.mode == Mode::Competitive && self.round.is_some_and(|r| r.phase == Phase::Buy) {
+            input = Input {
+                equip: input.equip,
+                ..default()
+            };
+        } else {
+            if !self.can_move() {
+                return None;
+            }
+            motion::step(&mut self.body, input, &self.map, &self.tuning);
+        }
+        if !me.armed || self.mode == Mode::Surf {
+            return None;
+        }
+        self.rifle.tick(
+            input,
+            &self.body,
+            tick,
+            sendit_sim::shot_seed(me.id, command.seq),
+            &self.tuning,
+        )
+    }
+
     fn replay_pending(&mut self) {
-        if !self.can_move() || !self.map_ready {
+        if !self.map_ready {
             return;
         }
-        let armed = self.me().is_some_and(|p| p.armed);
-        for (index, cmd) in self.pending.iter().enumerate() {
-            motion::step(&mut self.body, cmd.input, &self.map, &self.tuning);
-            if armed {
-                let mut combat_input = cmd.input;
-                combat_input.fire &= self.mode != Mode::Surf;
-                self.rifle.tick(
-                    combat_input,
-                    &self.body,
-                    self.server_tick.wrapping_add(index as u32 + 1),
-                    sendit_sim::shot_seed(self.id.unwrap_or_default(), cmd.seq),
-                    &self.tuning,
-                );
-            }
+        let Some(me) = self.me().copied() else { return };
+        for index in 0..self.pending.len() {
+            self.advance_prediction(
+                self.pending[index],
+                self.server_tick.wrapping_add(index as u32 + 1),
+                me,
+            );
         }
     }
 
@@ -433,7 +521,7 @@ impl Session {
             return;
         }
         self.last_packet = Instant::now();
-        let old_self = self.me().map(|p| (p.life, p.hp, p.kills));
+        let old_self = self.me().copied();
         self.previous_tick = if self.last_snapshot.is_some() {
             self.server_tick
         } else {
@@ -443,30 +531,55 @@ impl Session {
         self.last_snapshot = Some(Instant::now());
         self.previous = std::mem::replace(&mut self.players, players);
         self.round = Some(round);
+        let Some(me) = self.me().copied() else { return };
+        let (body, rifle, ack, life, hp, kills, yaw) =
+            (me.body, me.rifle, me.ack, me.life, me.hp, me.kills, me.yaw);
+        let now = Instant::now();
+        self.remote_shots
+            .retain(|id, _| self.players.iter().any(|p| p.id == *id));
         for player in &self.players {
             if Some(player.id) == self.id {
                 continue;
             }
-            if let Some(old) = self
+            let old = self
                 .previous
                 .iter()
-                .find(|p| p.id == player.id && p.life == player.life)
-            {
-                if old.shot_tick != player.shot_tick && player.shot.is_some() {
-                    audio.emit(
-                        Cue::Shot,
-                        player.body.pos + Vec3::Y * motion::EYE_HEIGHT,
-                        true,
-                    );
-                }
-                if player.hp > 0 && player.body.grounded {
-                    audio.walk(player.id, player.body.pos, old.body.pos);
+                .find(|p| p.id == player.id && p.life == player.life);
+            let Some(old) = old else {
+                self.remote_shots.remove(&player.id);
+                audio.reset_actor(player.id);
+                continue;
+            };
+            if let Some(shot) = player.shot.filter(|shot| {
+                old.shot_tick != player.shot_tick && !older(shot.tick, self.previous_tick)
+            }) {
+                self.remote_shots.insert(player.id, (shot, now));
+                audio.emit_actor(Cue::Shot(shot.weapon), shot.origin, player.id);
+                let enemy = self.mode != Mode::Competitive || player.team != me.team;
+                if me.hp > 0 && enemy && shot.weapon != Weapon::Knife {
+                    let eye = me.body.eye();
+                    let distance = shot.origin.distance(eye);
+                    let range = 17. * sendit_sim::bots::sound_gain(&self.map, eye, shot.origin);
+                    let pass = near_miss(shot, eye, me.id);
+                    if distance < range.min(Cue::Shot(shot.weapon).range()) || pass.is_some() {
+                        self.nearby_fire = Some((now, shot.origin));
+                    }
+                    if let Some(point) = pass {
+                        audio.emit(Cue::Pass, point, true);
+                    }
                 }
             }
+            if player.hp > 0 && player.rifle.reload_left > 0 && old.rifle.reload_left == 0 {
+                audio.emit_actor(
+                    Cue::Reload(player.rifle.weapon),
+                    player.body.eye(),
+                    player.id,
+                );
+            }
+            if player.hp > 0 && old.hp > 0 && player.body.grounded && old.body.grounded {
+                audio.walk(player.id, player.body.pos, old.body.pos);
+            }
         }
-        let Some(me) = self.me() else { return };
-        let (body, rifle, ack, life, hp, kills, yaw) =
-            (me.body, me.rifle, me.ack, me.life, me.hp, me.kills, me.yaw);
         if self
             .reset_life
             .is_some_and(|(previous_life, _, _)| previous_life == life)
@@ -482,7 +595,7 @@ impl Session {
             );
             self.announced_player = true;
         }
-        let changed_life = old_self.is_none_or(|p| p.0 != life);
+        let changed_life = old_self.is_none_or(|p| p.life != life);
         if changed_life {
             if old_self.is_some() && self.mode == Mode::Deathmatch {
                 // Start the new life displaying the current snapshot. Its first
@@ -496,14 +609,32 @@ impl Session {
             self.pending.clear();
             self.accumulator = 0.;
             self.local_shot = None;
+            self.local_shot_time = None;
+            self.confirmed_local_shot = None;
+            self.confirmed_hit_at = None;
+            self.damage_origin = None;
+            self.damage_at = None;
+            self.nearby_fire = None;
+            self.scope_held = false;
             self.walk_distance = 0.;
-        } else if let Some((_, old_hp, old_kills)) = old_self {
-            if hp < old_hp {
-                self.damage_at = Some(Instant::now());
-                audio.emit(Cue::Damage, body.pos, false);
+            audio.reset_actor(me.id);
+        } else if let Some(old) = old_self {
+            if let Some(shot) = me.shot.filter(|_| old.shot_tick != me.shot_tick) {
+                self.confirmed_local_shot = Some((shot, now));
+                if shot.hit.is_some() {
+                    self.confirmed_hit_at = Some(now);
+                }
             }
-            if kills > old_kills {
-                self.hit_at = Some(Instant::now());
+            let hit = me
+                .last_hit
+                .filter(|h| old.last_hit.is_none_or(|prior| prior.tick != h.tick));
+            if hp < old.hp || hit.is_some() {
+                self.damage_at = Some(now);
+                self.damage_origin = hit.map(|h| h.origin);
+                audio.emit_actor(Cue::Damage, body.pos, me.id);
+            }
+            if kills > old.kills {
+                self.hit_at = Some(now);
             }
         }
         if hp == 0
@@ -567,9 +698,12 @@ pub fn receive(
                 mode,
                 tuning,
             } => {
+                let old_epoch = s.epochs;
                 if let Err(e) = s.welcome(id, token, tick, &map, mode, tuning) {
                     eprintln!("{e}");
                     exit.send(AppExit::error());
+                } else if old_epoch != s.epochs {
+                    sound.reset_world();
                 }
             }
             ServerMsg::MapChunk {
@@ -740,6 +874,7 @@ pub fn sample(
     mut mouse: EventReader<MouseMotion>,
     mut opts: ResMut<Options>,
     ready: Option<Res<crate::LobbyRender>>,
+    menu: Option<Res<crate::menu::MenuState>>,
     mut exit: EventWriter<AppExit>,
     mut s: ResMut<Session>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
@@ -749,7 +884,10 @@ pub fn sample(
         return;
     };
     let movement = mouse.read().map(|e| e.delta).sum::<Vec2>();
-    if s.local_lobby {
+    let menu_blocks_input = menu
+        .as_ref()
+        .is_some_and(|menu| menu.open || menu.suppress_game_input);
+    if s.local_lobby && !menu_blocks_input {
         use bevy::input::keyboard::Key;
         for key in keyboard_events
             .read()
@@ -790,18 +928,22 @@ pub fn sample(
             return;
         }
     }
-    if keys.just_pressed(KeyCode::F1) {
+    if !menu_blocks_input && keys.just_pressed(KeyCode::F1) {
         s.show_help = !s.show_help;
     }
-    if keys.just_pressed(KeyCode::F3) {
+    if !menu_blocks_input && keys.just_pressed(KeyCode::F3) {
         s.show_debug = !s.show_debug;
     }
-    let just_grabbed = buttons.just_pressed(MouseButton::Left) && !s.captured && window.focused;
+    let just_grabbed = !menu_blocks_input
+        && buttons.just_pressed(MouseButton::Left)
+        && !s.captured
+        && window.focused;
     if just_grabbed {
         s.captured = true;
         s.suppress_fire_until_release = true;
+        s.suppress_scope_until_release = buttons.pressed(MouseButton::Right);
     }
-    if keys.just_pressed(KeyCode::Escape) || !window.focused {
+    if (menu.is_none() && keys.just_pressed(KeyCode::Escape)) || !window.focused {
         s.captured = false;
     }
     let grab = if s.captured {
@@ -809,11 +951,63 @@ pub fn sample(
     } else {
         CursorGrabMode::None
     };
-    if window.cursor_options.grab_mode != grab {
+    if window.cursor_options.grab_mode != grab || window.cursor_options.visible == s.captured {
         window.cursor_options.grab_mode = grab;
         window.cursor_options.visible = !s.captured;
     }
+    if menu_blocks_input {
+        keyboard_events.clear();
+        s.input = Input {
+            yaw: s.input.yaw,
+            pitch: s.input.pitch,
+            ..default()
+        };
+        s.tap_fire = false;
+        s.fire_held = false;
+        s.scope_held = false;
+        s.suppress_fire_until_release = buttons.pressed(MouseButton::Left);
+        s.suppress_scope_until_release = buttons.pressed(MouseButton::Right);
+        s.scoreboard = false;
+        s.tab_since = None;
+        return;
+    }
     let live = s.captured && s.replay.is_none() && (opts.benchmark.is_none() || opts.live_input);
+    if !buttons.pressed(MouseButton::Right) {
+        s.suppress_scope_until_release = false;
+    }
+    s.scope_held = live && buttons.pressed(MouseButton::Right) && !s.suppress_scope_until_release;
+    if live && s.mode != Mode::Surf {
+        // Physical key codes preserve the number-row layout; logical digits
+        // also work with alternate X11 keymaps and the numeric keypad.
+        for (slot, key) in [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if keys.just_pressed(key) {
+                s.input.equip = Some(Weapon::ALL[slot]);
+            }
+        }
+        for key in keyboard_events
+            .read()
+            .filter(|key| key.state.is_pressed() && !key.repeat)
+        {
+            if let bevy::input::keyboard::Key::Character(ch) = &key.logical_key {
+                if let [digit @ b'1'..=b'6'] = ch.as_bytes() {
+                    s.input.equip = Some(Weapon::ALL[(digit - b'1') as usize]);
+                }
+            }
+        }
+    } else {
+        keyboard_events.clear();
+        s.input.equip = None;
+    }
     if live && !just_grabbed {
         if let Some(mut stamp) = stamp {
             if movement != Vec2::ZERO
@@ -838,6 +1032,10 @@ pub fn sample(
     s.fire_held = live && buttons.pressed(MouseButton::Left) && !s.suppress_fire_until_release;
     if !live {
         s.tap_fire = false;
+        s.input.jump = false;
+        s.input.reload = false;
+        s.input.buy = false;
+        s.input.drop_bomb = false;
     }
     s.tap_fire |= live
         && buttons.just_pressed(MouseButton::Left)
@@ -868,7 +1066,7 @@ pub fn sample(
         && (!dead
             || s.tab_since
                 .is_some_and(|at| at.elapsed() >= Duration::from_millis(220)));
-    if keys.just_pressed(KeyCode::F5) && matches!(s.mode, Mode::Practice | Mode::Surf) {
+    if live && keys.just_pressed(KeyCode::F5) && matches!(s.mode, Mode::Practice | Mode::Surf) {
         if let (Some((body, yaw)), Some(life)) = (s.spawn, s.me().map(|p| p.life)) {
             s.send(&ClientMsg::Reset {
                 token: s.token,
@@ -881,6 +1079,10 @@ pub fn sample(
             s.rifle = Rifle::default();
             s.pending.clear();
             s.local_shot = None;
+            s.local_shot_time = None;
+            s.confirmed_local_shot = None;
+            s.confirmed_hit_at = None;
+            s.scope_held = false;
             s.walk_distance = 0.;
             s.replay_tick = 0;
         }
@@ -889,6 +1091,19 @@ pub fn sample(
 
 fn older(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
+}
+
+/// Closest point of this server-resolved shot segment to the listener.
+fn near_miss(shot: Shot, ear: Vec3, listener: u16) -> Option<Vec3> {
+    if shot.weapon == Weapon::Knife || shot.hit == Some(listener) {
+        return None;
+    }
+    let along = (ear - shot.origin).dot(shot.direction);
+    if !(2.0..shot.distance).contains(&along) {
+        return None;
+    }
+    let point = shot.origin + shot.direction * along;
+    (point.distance_squared(ear) < 1.15 * 1.15).then_some(point)
 }
 
 // A deterministic camera route for graphical measurements without a recorded human session.
@@ -914,6 +1129,7 @@ pub fn predict(
     time: Res<Time<Real>>,
     opts: Res<Options>,
     mut session: ResMut<Session>,
+    menu: Option<Res<crate::menu::MenuState>>,
     mut audio: ResMut<Sound>,
     mut stamp: Option<ResMut<InputClock>>,
 ) {
@@ -936,12 +1152,22 @@ pub fn predict(
         }
         s.reset_life = None;
     }
+    let blocked = menu
+        .as_ref()
+        .is_some_and(|m| m.open || m.suppress_game_input);
     s.accumulator += time.delta_secs().min(0.125);
     while s.accumulator >= DT {
         s.accumulator -= DT;
         s.sequence = s.sequence.wrapping_add(1);
-        let automated = s.replay.is_some() || (opts.benchmark.is_some() && !opts.live_input);
-        let input = if let Some(replay) = &s.replay {
+        let automated =
+            !blocked && (s.replay.is_some() || (opts.benchmark.is_some() && !opts.live_input));
+        let input = if blocked {
+            Input {
+                yaw: s.input.yaw,
+                pitch: s.input.pitch,
+                ..default()
+            }
+        } else if let Some(replay) = &s.replay {
             replay.input_at(0, s.replay_tick)
         } else if opts.benchmark.is_some() && !opts.live_input {
             benchmark_command(s.replay_tick)
@@ -954,7 +1180,9 @@ pub fn predict(
                 stamp.0 = Some(Instant::now());
             }
         }
-        s.replay_tick = s.replay_tick.wrapping_add(1);
+        if !blocked {
+            s.replay_tick = s.replay_tick.wrapping_add(1);
+        }
         let command = Command {
             seq: s.sequence,
             seen_tick: s.seen_tick(),
@@ -977,32 +1205,21 @@ pub fn predict(
         if s.pending.len() > 256 {
             s.pending.pop_front();
         }
-        if s.can_move() {
-            let before = s.body.pos;
-            motion::step(&mut s.body, input, &s.map, &s.tuning);
-            if s.body.grounded {
-                s.walk_distance += (s.body.pos - before).with_y(0.).length();
-                if s.walk_distance >= sendit_sim::bots::STEP_STRIDE {
-                    s.walk_distance %= sendit_sim::bots::STEP_STRIDE;
-                    audio.emit(Cue::Step, s.body.pos, false);
-                }
-            }
-            if s.me().is_some_and(|p| p.armed) {
-                let tick = s.server_tick.wrapping_add(s.pending.len() as u32);
-                let mut combat_input = input;
-                combat_input.fire &= s.mode != Mode::Surf;
-                if let Some(shot) = s.rifle.tick(
-                    combat_input,
-                    &s.body,
-                    tick,
-                    sendit_sim::shot_seed(id, command.seq),
-                    &s.tuning,
-                ) {
-                    s.local_shot = Some(shot);
-                    s.local_shot_time = Some(Instant::now());
-                    audio.emit(Cue::Shot, s.body.pos, false);
-                }
-            }
+        let before = s.body;
+        let previous_rifle = s.rifle;
+        let tick = s.server_tick.wrapping_add(s.pending.len() as u32);
+        if let Some(shot) = s.advance_prediction(command, tick, me) {
+            s.local_shot = Some(shot);
+            s.local_shot_time = Some(Instant::now());
+            audio.emit_actor(Cue::Shot(shot.weapon), shot.origin, id);
+        }
+        if previous_rifle.reload_left == 0 && s.rifle.reload_left > 0 {
+            audio.emit_actor(Cue::Reload(s.rifle.weapon), s.body.eye(), id);
+        }
+        if s.body.grounded && before.grounded {
+            s.walk_distance = (s.walk_distance + (s.body.pos - before.pos).with_y(0.).length())
+                % sendit_sim::bots::STEP_STRIDE;
+            audio.walk(id, s.body.pos, before.pos);
         }
         s.tap_fire = false;
         s.input.fire = s.fire_held;
@@ -1010,6 +1227,7 @@ pub fn predict(
         s.input.drop_bomb = false;
         s.input.buy = false;
         s.input.reload = false;
+        s.input.equip = None;
         let from = s.pending.len().saturating_sub(wire::INPUT_REDUNDANCY);
         s.send(&ClientMsg::Input {
             token: s.token,
@@ -1035,6 +1253,275 @@ pub fn on_exit(mut exit: EventReader<AppExit>, mut s: ResMut<Session>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn practice_pair() -> (sendit_sim::World, Session, Sound) {
+        let mut world = sendit_sim::World::new(
+            Arena::load("drill").unwrap(),
+            Mode::Practice,
+            Tuning::default(),
+        );
+        assert!(world.add(1) && world.add(2));
+        let mut client = Session::open(&Options {
+            local_match: false,
+            ..default()
+        })
+        .unwrap();
+        client.id = Some(1);
+        client.map_ready = true;
+        let mut sound = Sound::new(true);
+        client.snapshot(0, world.views(), world.round_view(), &mut sound);
+        (world, client, sound)
+    }
+
+    #[test]
+    fn equip_reload_and_scope_follow_the_predicted_inventory_and_server_corrections() {
+        let (mut world, mut client, mut sound) = practice_pair();
+        client.captured = true;
+        client.scope_held = true;
+        assert!(!client.scoped());
+        let select = Command {
+            seq: 1,
+            seen_tick: 0,
+            input: Input {
+                equip: Some(Weapon::Sniper),
+                ..default()
+            },
+        };
+        let me = *client.me().unwrap();
+        client.advance_prediction(select, 1, me);
+        client.pending.push_back(select);
+        assert_eq!(client.weapon(), Weapon::Sniper);
+        assert!(!client.scoped());
+        world.advance(&[(1, select)]);
+        for seq in 2..64 {
+            let command = Command { seq, ..default() };
+            client.advance_prediction(command, seq, me);
+            client.pending.push_back(command);
+            world.advance(&[(1, command)]);
+            if seq % 5 == 0 {
+                client.snapshot(world.tick, world.views(), world.round_view(), &mut sound);
+            }
+        }
+        assert!(client.scoped());
+        for (seq, input) in [
+            (
+                64,
+                Input {
+                    fire: true,
+                    ..default()
+                },
+            ),
+            (
+                65,
+                Input {
+                    reload: true,
+                    ..default()
+                },
+            ),
+            (
+                66,
+                Input {
+                    equip: Some(Weapon::Pistol),
+                    ..default()
+                },
+            ),
+        ] {
+            let command = Command {
+                seq,
+                seen_tick: world.tick,
+                input,
+            };
+            client.advance_prediction(command, seq, me);
+            client.pending.push_back(command);
+            world.advance(&[(1, command)]);
+            if seq == 65 {
+                assert!(client.reload_fraction(1).is_some());
+                assert!(!client.scoped());
+            }
+        }
+        let expected = world.view(1).unwrap().rifle;
+        assert_eq!(client.rifle, expected);
+        assert!(client.reload_fraction(1).is_none());
+        assert_eq!(client.weapon(), Weapon::Pistol);
+        client.snapshot(world.tick, world.views(), world.round_view(), &mut sound);
+        assert_eq!(client.rifle, expected);
+    }
+
+    #[test]
+    fn numeric_keys_latch_across_frames_and_menu_mouse_presses_do_not_leak() {
+        let (_, mut session, _) = practice_pair();
+        session.captured = true;
+        let mut app = App::new();
+        app.insert_resource(session)
+            .insert_resource(Options::default())
+            .init_resource::<crate::menu::MenuState>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_event::<MouseMotion>()
+            .add_event::<bevy::input::keyboard::KeyboardInput>()
+            .add_event::<AppExit>()
+            .add_systems(Update, sample);
+        app.world_mut().spawn((
+            Window {
+                focused: true,
+                ..default()
+            },
+            PrimaryWindow,
+        ));
+        let digits = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+        ];
+        for (key, weapon) in digits.into_iter().zip(Weapon::ALL) {
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(key);
+            app.update();
+            assert_eq!(app.world().resource::<Session>().input.equip, Some(weapon));
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+            app.update();
+            assert_eq!(app.world().resource::<Session>().input.equip, Some(weapon));
+        }
+        let me = *app.world().resource::<Session>().me().unwrap();
+        let mut session = app.world_mut().resource_mut::<Session>();
+        for seq in 1..65 {
+            let input = Input {
+                equip: (seq == 1).then_some(Weapon::Sniper),
+                ..default()
+            };
+            session.advance_prediction(
+                Command {
+                    seq,
+                    input,
+                    ..default()
+                },
+                seq,
+                me,
+            );
+        }
+        {
+            let mut mouse = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+            mouse.press(MouseButton::Right);
+        }
+        app.update();
+        assert!(app.world().resource::<Session>().scoped());
+        app.world_mut()
+            .resource_mut::<crate::menu::MenuState>()
+            .open = true;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+        app.update();
+        let session = app.world().resource::<Session>();
+        assert_eq!(session.input.forward, 0.);
+        assert!(!session.scoped() && !session.input.fire && session.input.equip.is_none());
+        app.world_mut()
+            .resource_mut::<crate::menu::MenuState>()
+            .open = false;
+        app.update();
+        let session = app.world().resource::<Session>();
+        assert!(!session.scoped() && !session.input.fire);
+        for button in [MouseButton::Right, MouseButton::Left] {
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .release(button);
+        }
+        app.update();
+        {
+            let mut mouse = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+            mouse.clear();
+            mouse.press(MouseButton::Left);
+            mouse.press(MouseButton::Right);
+        }
+        app.update();
+        let session = app.world().resource::<Session>();
+        assert!(session.scoped() && session.input.fire);
+    }
+
+    #[test]
+    fn repeated_snapshots_never_replay_remote_shots_hits_or_old_life_sounds() {
+        let (mut world, mut client, mut sound) = practice_pair();
+        world.advance(&[(
+            2,
+            Command {
+                seq: 1,
+                input: Input {
+                    fire: true,
+                    ..default()
+                },
+                ..default()
+            },
+        )]);
+        let mut views = world.views();
+        let origin = Vec3::new(7., 1.6, 4.);
+        let attacker = views.iter_mut().find(|p| p.id == 2).unwrap();
+        let shot = attacker.shot.as_mut().unwrap();
+        shot.origin = origin;
+        attacker.body.pos.x += 9.;
+        let local = views.iter_mut().find(|p| p.id == 1).unwrap();
+        local.hp = 83;
+        local.last_hit = Some(sendit_sim::Hit {
+            tick: 1,
+            source: Some(2),
+            origin,
+            weapon: Some(Weapon::M4),
+            damage: 17,
+        });
+        client.snapshot(1, views.clone(), world.round_view(), &mut sound);
+        let first = client.shot_presentation(2).unwrap();
+        assert_eq!(first.0.origin, origin);
+        assert_eq!(client.damage_origin, Some(origin));
+        let hurt = client.damage_at;
+        assert!(hurt.is_some());
+        client.snapshot(1, views.clone(), world.round_view(), &mut sound);
+        client.snapshot(2, views, world.round_view(), &mut sound);
+        assert_eq!(client.shot_presentation(2), Some(first));
+        assert_eq!(client.damage_at, hurt);
+        assert_eq!(sound.queued(Cue::Shot(Weapon::M4)), 1);
+        assert_eq!(sound.queued(Cue::Damage), 1);
+        world.reset(2);
+        client.snapshot(3, world.views(), world.round_view(), &mut sound);
+        assert_eq!(client.shot_presentation(2), None);
+        assert_eq!(sound.queued(Cue::Shot(Weapon::M4)), 0);
+    }
+
+    #[test]
+    fn near_miss_uses_the_confirmed_segment_and_skips_direct_hits() {
+        let (mut world, _, _) = practice_pair();
+        world.advance(&[(
+            2,
+            Command {
+                seq: 1,
+                input: Input {
+                    fire: true,
+                    ..default()
+                },
+                ..default()
+            },
+        )]);
+        let mut shot = world.view(2).unwrap().shot.unwrap();
+        shot.origin = Vec3::ZERO;
+        shot.direction = Vec3::Z;
+        shot.distance = 8.;
+        shot.hit = None;
+        assert_eq!(
+            near_miss(shot, Vec3::new(0.6, 0., 6.), 1),
+            Some(Vec3::Z * 6.)
+        );
+        assert!(near_miss(shot, Vec3::new(0.6, 0., 9.), 1).is_none());
+        assert!(near_miss(shot, Vec3::new(4., 0., 6.), 1).is_none());
+        shot.hit = Some(1);
+        assert!(near_miss(shot, Vec3::new(0.6, 0., 6.), 1).is_none());
+    }
 
     #[test]
     fn local_menu_waits_for_a_new_click_and_holding_capture_never_fires() {

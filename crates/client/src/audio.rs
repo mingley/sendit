@@ -4,12 +4,11 @@ use bevy::{
     prelude::*,
 };
 use sendit_sim::{
-    bots::{SHOT_HEARING_RANGE, STEP_HEARING_RANGE, STEP_STRIDE},
-    BombView, Phase, RoundResult, TICK_RATE,
+    bots::{sound_gain, MELEE_HEARING_RANGE, SHOT_HEARING_RANGE, STEP_HEARING_RANGE, STEP_STRIDE},
+    BombView, Phase, RoundResult, Weapon, TICK_RATE,
 };
 use std::{
     collections::HashMap,
-    f32::consts::TAU,
     time::{Duration, Instant},
 };
 
@@ -19,10 +18,15 @@ pub fn listener() -> SpatialListener {
     SpatialListener::new(-0.28)
 }
 
-#[derive(Clone, Copy)]
+mod synth;
+use synth::{synthesize, Coloration};
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Cue {
-    Shot,
-    Step,
+    Shot(Weapon),
+    Reload(Weapon),
+    Step(bool),
+    Pass,
     Damage,
     Objective,
     Use,
@@ -31,22 +35,39 @@ pub enum Cue {
     Detonated,
 }
 
-const CUES: [Cue; 8] = [
-    Cue::Shot,
-    Cue::Step,
-    Cue::Damage,
-    Cue::Objective,
-    Cue::Use,
-    Cue::Armed,
-    Cue::Defused,
-    Cue::Detonated,
-];
-
 impl Cue {
+    fn all() -> impl Iterator<Item = Self> {
+        [
+            Self::Step(false),
+            Self::Step(true),
+            Self::Pass,
+            Self::Damage,
+            Self::Objective,
+            Self::Use,
+            Self::Armed,
+            Self::Defused,
+            Self::Detonated,
+        ]
+        .into_iter()
+        .chain(Weapon::ALL.into_iter().map(Self::Shot))
+        .chain(
+            Weapon::ALL
+                .into_iter()
+                .filter(|w| *w != Weapon::Knife)
+                .map(Self::Reload),
+        )
+    }
+
     fn duration(self) -> f32 {
         match self {
-            Self::Shot => 0.19,
-            Self::Step => 0.13,
+            Self::Shot(Weapon::Knife) => 0.17,
+            Self::Shot(Weapon::Pistol) => 0.16,
+            Self::Shot(Weapon::M4) => 0.19,
+            Self::Shot(Weapon::Ak) => 0.25,
+            Self::Shot(Weapon::Sniper) => 0.55,
+            Self::Shot(Weapon::Smg) => 0.12,
+            Self::Reload(_) => 0.30,
+            Self::Step(_) | Self::Pass => 0.13,
             Self::Damage => 0.16,
             Self::Objective => 0.15,
             Self::Use => 0.13,
@@ -56,32 +77,43 @@ impl Cue {
         }
     }
 
-    /// Gain, radius of the inner full-volume region, cutoff radius in world meters.
+    /// Source volume, full-volume radius, maximum audible distance in meters.
     fn mix(self) -> (f32, f32, f32) {
         match self {
-            Self::Shot => (0.56, 13.0, SHOT_HEARING_RANGE),
-            Self::Step => (0.44, 6.0, STEP_HEARING_RANGE),
-            Self::Damage => (0.45, 1.0, 1.0),
-            Self::Objective => (0.45, 11.0, 45.0),
-            Self::Use => (0.4, 4.0, 13.0),
+            Self::Shot(Weapon::Knife) => (0.43, 4., MELEE_HEARING_RANGE),
+            Self::Shot(Weapon::Sniper) => (0.72, 17., SHOT_HEARING_RANGE),
+            Self::Shot(Weapon::Smg) => (0.51, 10., SHOT_HEARING_RANGE),
+            Self::Shot(_) => (0.60, 13., SHOT_HEARING_RANGE),
+            Self::Reload(_) => (0.36, 4., 13.),
+            Self::Step(_) => (0.50, 6., STEP_HEARING_RANGE),
+            Self::Pass => (0.45, 1.5, 3.),
+            Self::Damage => (0.48, 1., 1.),
+            Self::Objective => (0.45, 11., 45.),
+            Self::Use => (0.4, 4., 13.),
             Self::Armed | Self::Defused => (0.5, 15., 65.),
             Self::Detonated => (0.63, 32., 100.),
         }
     }
+
+    pub fn range(self) -> f32 {
+        self.mix().2
+    }
 }
 
+#[derive(Clone, Copy)]
 struct Emission {
     cue: Cue,
     pos: Vec3,
     spatial: bool,
+    owner: Option<u16>,
 }
 
 #[derive(Resource)]
 pub struct Sound {
     enabled: bool,
-    clips: Option<[Handle<AudioSource>; CUES.len()]>,
+    clips: HashMap<Cue, [Handle<AudioSource>; 3]>,
     queue: Vec<Emission>,
-    strides: HashMap<u16, f32>,
+    strides: HashMap<u16, (f32, bool)>,
     last_pulse: Option<(u16, u32)>,
     phase: Option<(u16, Phase)>,
     actor: Option<u16>,
@@ -93,7 +125,7 @@ impl Sound {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            clips: None,
+            clips: HashMap::new(),
             queue: Vec::new(),
             strides: HashMap::new(),
             last_pulse: None,
@@ -105,25 +137,76 @@ impl Sound {
     }
 
     pub fn emit(&mut self, cue: Cue, pos: Vec3, spatial: bool) {
-        if self.enabled && self.queue.len() < 64 && pos.is_finite() {
-            self.queue.push(Emission { cue, pos, spatial });
+        self.enqueue(Emission {
+            cue,
+            pos,
+            spatial,
+            owner: None,
+        });
+    }
+
+    pub fn emit_actor(&mut self, cue: Cue, pos: Vec3, owner: u16) {
+        self.enqueue(Emission {
+            cue,
+            pos,
+            spatial: cue != Cue::Damage,
+            owner: Some(owner),
+        });
+    }
+
+    fn enqueue(&mut self, event: Emission) {
+        if !self.enabled || !event.pos.is_finite() {
+            return;
         }
+        // Coalesce buffered snapshots arriving in the same audio frame. Keep
+        // different participants audible even if they share a weapon.
+        if let Some(existing) = self
+            .queue
+            .iter_mut()
+            .rev()
+            .find(|e| e.owner == event.owner && e.cue == event.cue)
+        {
+            *existing = event;
+        } else if self.queue.len() < 64 {
+            self.queue.push(event);
+        }
+    }
+
+    pub fn reset_actor(&mut self, id: u16) {
+        self.strides.remove(&id);
+        self.queue.retain(|event| event.owner != Some(id));
+    }
+
+    #[cfg(test)]
+    pub(super) fn queued(&self, cue: Cue) -> usize {
+        self.queue.iter().filter(|e| e.cue == cue).count()
+    }
+
+    pub fn reset_world(&mut self) {
+        self.strides.clear();
+        self.queue.clear();
+        self.last_pulse = None;
+        self.phase = None;
+        self.actor = None;
+        self.last_use = None;
     }
 
     pub fn walk(&mut self, id: u16, pos: Vec3, previous: Vec3) {
         if !self.enabled {
             return;
         }
-        let distance = (pos - previous).with_y(0.0).length();
-        if !distance.is_finite() || distance > 3.0 {
+        let distance = (pos - previous).with_y(0.).length();
+        if !distance.is_finite() || distance > 3. {
             self.strides.remove(&id);
             return;
         }
-        let stride = self.strides.entry(id).or_default();
+        let (stride, alternate) = self.strides.entry(id).or_default();
         *stride += distance;
         if *stride >= STEP_STRIDE {
             *stride %= STEP_STRIDE;
-            self.emit(Cue::Step, pos + Vec3::Y * 0.1, true);
+            *alternate = !*alternate;
+            let cue = Cue::Step(*alternate);
+            self.emit_actor(cue, pos + Vec3::Y * 0.15, id);
         }
     }
 
@@ -187,15 +270,76 @@ impl Sound {
     }
 }
 
-/// Synthesize the original mono clips once. Rodio spatializes the same source at each emitter.
+#[cfg(test)]
+mod tests;
+
+/// Produce all three filtered variants once; firing creates no sample buffers.
 pub fn setup(mut sound: ResMut<Sound>, mut assets: ResMut<Assets<AudioSource>>) {
     if sound.enabled {
-        sound.clips = Some(CUES.map(|cue| {
-            assets.add(AudioSource {
-                bytes: synth(cue).into(),
+        sound.clips = Cue::all()
+            .map(|cue| {
+                (
+                    cue,
+                    Coloration::ALL.map(|tone| {
+                        assets.add(AudioSource {
+                            bytes: synthesize(cue, tone).into(),
+                        })
+                    }),
+                )
             })
-        }));
+            .collect();
     }
+}
+
+struct Mix {
+    gain: f32,
+    radius: f32,
+    color: Coloration,
+    spatial: bool,
+}
+
+fn mix(
+    event: Emission,
+    listener: &Transform,
+    subject: Option<u16>,
+    map: &sendit_sim::Arena,
+) -> Option<Mix> {
+    let (mut gain, radius, cutoff) = event.cue.mix();
+    let spatial = event.spatial && (event.owner.is_none() || event.owner != subject);
+    if !spatial {
+        if matches!(event.cue, Cue::Step(_)) {
+            gain *= 0.68;
+        }
+        return Some(Mix {
+            gain,
+            radius,
+            color: Coloration::Clear,
+            spatial,
+        });
+    }
+    let offset = event.pos - listener.translation;
+    let distance = offset.length();
+    if distance >= cutoff {
+        return None;
+    }
+    let direction = listener.rotation.inverse() * offset.normalize_or_zero();
+    let transmission = sound_gain(map, listener.translation, event.pos);
+    // Rear sources lose treble, with extra acoustic shadow for sources on
+    // another floor or beyond cover. The spatial sink still follows head turns.
+    let color = if transmission < 0.99 || direction.y < -0.62 {
+        Coloration::Muffled
+    } else if direction.z > 0.28 || direction.y > 0.62 || distance > radius * 2.3 {
+        Coloration::Soft
+    } else {
+        Coloration::Clear
+    };
+    gain *= transmission * (1. - 0.14 * direction.z.max(0.));
+    Some(Mix {
+        gain,
+        radius,
+        color,
+        spatial,
+    })
 }
 
 #[derive(Component)]
@@ -205,7 +349,7 @@ pub fn play(
     mut commands: Commands,
     mut sound: ResMut<Sound>,
     session: Res<Session>,
-    listener: Query<&GlobalTransform, With<SpatialListener>>,
+    listener: Query<&Transform, With<SpatialListener>>,
     unstarted: Query<(Entity, &QueuedAt), (Without<AudioSink>, Without<SpatialAudioSink>)>,
 ) {
     if !sound.enabled {
@@ -226,153 +370,27 @@ pub fn play(
     if sound.queue.is_empty() {
         return;
     }
-    let ear = listener
-        .get_single()
-        .map_or_else(|_| session.body.eye(), GlobalTransform::translation);
+    let fallback = Transform::from_translation(session.body.eye())
+        .with_rotation(Quat::from_rotation_y(-session.input.yaw));
+    let ear = listener.get_single().unwrap_or(&fallback);
+    let subject = session.spectate.or(session.id);
     let Sound { queue, clips, .. } = &mut *sound;
-    let Some(clips) = clips else { return };
     for event in queue.drain(..) {
-        let (mut gain, inner_radius, cutoff) = event.cue.mix();
-        if event.spatial {
-            let offset = event.pos - ear;
-            let distance = offset.length();
-            if distance >= cutoff {
-                continue;
-            }
-            if distance > 0.1 && session.map.ray_distance(ear, offset, distance) < distance - 0.15 {
-                gain *= 0.52;
-            }
-        }
+        let Some(mix) = mix(event, ear, subject, &session.map) else {
+            continue;
+        };
+        let Some(variants) = clips.get(&event.cue) else {
+            continue;
+        };
         let settings = PlaybackSettings::DESPAWN
-            .with_spatial(event.spatial)
-            .with_spatial_scale(SpatialScale::new(1.0 / inner_radius))
-            .with_volume(Volume::new(gain));
+            .with_spatial(mix.spatial)
+            .with_spatial_scale(SpatialScale::new(1.0 / mix.radius))
+            .with_volume(Volume::new(mix.gain));
         commands.spawn((
-            AudioPlayer::new(clips[event.cue as usize].clone()),
+            AudioPlayer::new(variants[mix.color as usize].clone()),
             Transform::from_translation(event.pos),
             settings,
             QueuedAt(Instant::now()),
         ));
-    }
-}
-
-fn synth(cue: Cue) -> Vec<u8> {
-    const RATE: u32 = 24_000;
-    let samples = (cue.duration() * RATE as f32) as u32;
-    let data_size = 2 * samples;
-    let mut wav = Vec::with_capacity((44 + data_size) as usize);
-    // Mono signed 16-bit linear PCM.
-    wav.extend(b"RIFF");
-    wav.extend((36 + data_size).to_le_bytes());
-    wav.extend(b"WAVEfmt ");
-    wav.extend(16u32.to_le_bytes());
-    wav.extend(1u16.to_le_bytes());
-    wav.extend(1u16.to_le_bytes());
-    wav.extend(RATE.to_le_bytes());
-    wav.extend((2 * RATE).to_le_bytes());
-    wav.extend(2u16.to_le_bytes());
-    wav.extend(16u16.to_le_bytes());
-    wav.extend(b"data");
-    wav.extend(data_size.to_le_bytes());
-
-    let mut noise = 0x2bd2_a719u32;
-    let mut filtered = 0.0f32;
-    for i in 0..samples {
-        let t = i as f32 / RATE as f32;
-        noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        let white = (noise >> 8) as f32 / 8_388_608.0 - 1.0;
-        filtered += 0.16 * (white - filtered);
-        let tone = |hz: f32| (TAU * hz * t).sin();
-        let decay = |rate: f32| (-rate * t).exp();
-        let signal = match cue {
-            Cue::Shot => {
-                0.66 * white * decay(83.0)
-                    + 0.52 * filtered * decay(20.0)
-                    + 0.29 * (TAU * (79.0 * t + (1.0 - decay(44.0)))).sin() * decay(27.0)
-            }
-            Cue::Step => {
-                0.62 * tone(92.0) * decay(34.0)
-                    + 0.60 * filtered * decay(31.0)
-                    + 0.25 * white * (-150.0 * (t - 0.032).abs()).exp()
-            }
-            Cue::Damage => {
-                (0.42 * tone(182.0) + 0.24 * tone(211.0) + 0.27 * filtered) * decay(24.0)
-            }
-            Cue::Use => 0.45 * filtered * decay(50.) + 0.35 * tone(420.) * decay(75.),
-            Cue::Armed => 0.55 * (TAU * (390. * t + 680. * t * t)).sin() * decay(6.),
-            Cue::Defused => {
-                let pitch = if t < 0.14 {
-                    523.25
-                } else if t < 0.28 {
-                    659.25
-                } else {
-                    783.99
-                };
-                let envelope = (std::f32::consts::PI * (t % 0.14) / 0.14).sin().powi(2);
-                0.52 * tone(pitch) * envelope
-            }
-            Cue::Detonated => (0.56 * filtered + 0.41 * tone(63.0) + 0.23 * tone(47.)) * decay(8.),
-            Cue::Objective => {
-                let tap = |start: f32, hz: f32| {
-                    let phase = t - start;
-                    if (0.0..0.060).contains(&phase) {
-                        0.70 * (TAU * hz * phase).sin()
-                            * (std::f32::consts::PI * phase / 0.06).sin().powi(2)
-                    } else {
-                        0.0
-                    }
-                };
-                tap(0.0, 713.0) + tap(0.077, 953.0)
-            }
-        };
-        let attack = (t * 1200.0).min(1.0);
-        let tail = ((cue.duration() - t) * 250.0).min(1.0);
-        let sample = (signal.clamp(-1.0, 1.0) * attack * tail * i16::MAX as f32) as i16;
-        wav.extend(sample.to_le_bytes());
-    }
-    wav
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy::audio::Decodable;
-
-    #[test]
-    fn synthesized_clips_decode_and_have_signal() {
-        for cue in CUES {
-            let source = AudioSource {
-                bytes: synth(cue).into(),
-            };
-            let mut decoder = source.decoder();
-            assert!(decoder.any(|sample| sample != 0));
-        }
-    }
-
-    #[test]
-    fn footsteps_pan_toward_the_source_when_the_listener_turns() {
-        let ears = listener();
-        let scale = 1.0 / Cue::Step.mix().1;
-        let source = AudioSource {
-            bytes: synth(Cue::Step).into(),
-        };
-        let emitter = Vec3::X * 8.0 * scale;
-        for (yaw, expect_right) in [(0.0, true), (std::f32::consts::PI, false)] {
-            let rotate = Quat::from_rotation_y(yaw);
-            let mut stereo = rodio::source::Spatial::new(
-                source.decoder(),
-                emitter.to_array(),
-                (rotate * ears.left_ear_offset * scale).to_array(),
-                (rotate * ears.right_ear_offset * scale).to_array(),
-            );
-            let mut left_energy = 0.0;
-            let mut right_energy = 0.0;
-            while let (Some(left), Some(right)) = (stereo.next(), stereo.next()) {
-                left_energy += f64::from(left).powi(2);
-                right_energy += f64::from(right).powi(2);
-            }
-            assert!(left_energy > 0.0 && right_energy > 0.0);
-            assert_eq!(right_energy > left_energy, expect_right);
-        }
     }
 }
