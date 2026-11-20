@@ -1,7 +1,11 @@
 //! A compact, high-contrast match HUD. Diagnostic details and the control sheet are opt-in.
+pub mod scoreboard;
 use crate::{game::Session, options::Options};
-use bevy::prelude::*;
-use sendit_sim::{BombView, Mode, Phase, TICK_RATE};
+use bevy::{prelude::*, window::PrimaryWindow};
+use sendit_sim::{
+    rules::{can_reach_objective, RoundResult, KIT_COST},
+    BombView, Mode, Phase, TICK_RATE,
+};
 use std::time::{Duration, Instant};
 
 fn ink() -> Color {
@@ -28,6 +32,7 @@ pub enum Field {
     Help,
     Stats,
     Cash,
+    Armor,
 }
 #[derive(Component)]
 pub struct Reticle;
@@ -117,6 +122,7 @@ pub fn setup(
         .with_children(|row| {
             row.spawn(text("HP", 15., ash()));
             row.spawn((text("-", 33., Color::WHITE), Field::Health));
+            row.spawn((text("", 14., ash()), Field::Armor));
             row.spawn((text("", 15., amber()), Field::Cash));
         });
     commands
@@ -220,6 +226,7 @@ pub fn setup(
                 BackgroundColor(ink()),
             ));
         });
+    scoreboard::spawn(&mut commands);
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::from_length(0.075))),
         MeshMaterial3d(mats.add(StandardMaterial {
@@ -283,7 +290,23 @@ pub fn update(
     };
     for (field, mut label) in &mut fields {
         let value = match field {
-            Field::Map => format!("{}  /  {mode}", s.map.name.to_uppercase()),
+            Field::Map => {
+                if s.mode == Mode::Competitive {
+                    let side = me.map_or("COMPETITIVE", |p| {
+                        if p.team == 0 {
+                            "T SIDE"
+                        } else {
+                            "CT SIDE"
+                        }
+                    });
+                    format!("{}  /  {side}", s.map.name.to_uppercase())
+                } else {
+                    format!("{}  /  {mode}", s.map.name.to_uppercase())
+                }
+            }
+            Field::Armor => me
+                .filter(|p| p.armor > 0)
+                .map_or_else(String::new, |p| format!("{} ARMOR", p.armor)),
             Field::Link => format!(
                 "{} PLAYERS   |   {} ms",
                 s.players.len(),
@@ -299,7 +322,11 @@ pub fn update(
             }
             Field::Ammo => {
                 if me.is_some_and(|p| p.armed && p.hp > 0) {
-                    format!("{:02}", s.rifle.ammo)
+                    if s.mode == Mode::Competitive {
+                        format!("{:02}/{:02}", s.rifle.ammo, s.rifle.magazine)
+                    } else {
+                        format!("{:02}", s.rifle.ammo)
+                    }
                 } else {
                     "-".into()
                 }
@@ -336,9 +363,11 @@ pub fn update(
                 }
             }
             Field::Action => {
-                if me.is_some_and(|p| p.hp == 0) {
+                if s.mode == Mode::Competitive && s.round.is_some_and(|r| r.phase == Phase::Ended) {
+                    ended(&s)
+                } else if me.is_some_and(|p| p.hp == 0) {
                     if let Some(who) = s.spectate {
-                        format!("   Spectating player {who}   |   Tab to switch   ")
+                        format!("   Spectating {}   |   Tap Tab to switch   ", s.name(who))
                     } else {
                         "   Eliminated   ".into()
                     }
@@ -356,33 +385,38 @@ pub fn update(
                 }
             }
             Field::Status => {
-                if !s.status.is_empty() {
+                if s.scoreboard {
+                    String::new()
+                } else if !s.status.is_empty() {
                     format!("   {}   ", s.status)
-                } else if !s.captured && s.replay.is_none() && opts.benchmark.is_none() {
+                } else if !s.captured
+                    && s.replay.is_none()
+                    && (opts.benchmark.is_none() || opts.live_input)
+                {
                     "   Click to capture mouse   ".into()
                 } else {
                     String::new()
                 }
             }
             Field::Hints => {
-                if s.show_help {
+                if s.show_help || s.scoreboard {
                     String::new()
                 } else if matches!(s.mode, Mode::Practice | Mode::Surf) {
                     "   F1  Controls     F3  Telemetry     F5  Reset   ".into()
                 } else {
-                    "   F1  Controls     F3  Telemetry   ".into()
+                    "   Tab  Scoreboard     F1  Controls   ".into()
                 }
             }
             Field::Stats => {
-                if s.show_debug {
+                if s.show_debug && !s.scoreboard {
                     telemetry(&s)
                 } else {
                     String::new()
                 }
             }
             Field::Help => {
-                if s.show_help {
-                    "   CONTROLS\n\n   WASD     Move             Mouse     Aim\n   Space     Jump             LMB         Fire\n   R             Reload          Esc           Release mouse\n   E             Plant / defuse (hold) or recover\n   G             Drop bomb    B              Buy rifle\n   Tab         Next teammate when spectating\n   F3           Shot telemetry\n   F5           Reset practice or surf\n\n   F1           Close   ".into()
+                if s.show_help && !s.scoreboard {
+                    "   CONTROLS\n\n   WASD     Move             Mouse     Aim\n   Space     Jump             LMB         Fire\n   R             Reload          Esc           Release mouse\n   E             Plant / defuse (hold) or recover\n   G             Drop bomb    B              Buy rifle\n   Tab         Hold for scores, tap to cycle spectator\n   F3           Shot telemetry\n   F5           Reset practice or surf\n\n   F1           Close   ".into()
                 } else {
                     String::new()
                 }
@@ -394,27 +428,105 @@ pub fn update(
     }
 }
 
-fn objective(s: &Session) -> String {
-    let (Some(r), Some(p)) = (s.round.as_ref(), s.me()) else {
+pub fn scale(windows: Query<&Window, With<PrimaryWindow>>, mut ui: ResMut<UiScale>) {
+    if let Ok(window) = windows.get_single() {
+        let scale = (window.width() / 1060.)
+            .min(window.height() / 610.)
+            .clamp(0.53, 1.0);
+        if ui.0 != scale {
+            ui.0 = scale;
+        }
+    }
+}
+
+fn ended(s: &Session) -> String {
+    let Some(r) = s.round else {
         return String::new();
     };
-    let percent = (r.progress * 100.).round().clamp(0., 100.);
-    if percent > 0. {
-        return format!("   Objective   {percent:.0}%   ");
+    let Some(winner) = r.winner else {
+        return "   Round complete   ".into();
+    };
+    let team = if winner == 0 {
+        "Terrorists"
+    } else {
+        "Counter-Terrorists"
+    };
+    let reason = match r.result {
+        Some(RoundResult::Defused) => "bomb defused",
+        Some(RoundResult::Detonated) => "bomb detonated",
+        Some(RoundResult::Elimination) => "elimination",
+        Some(RoundResult::Time) => "time expired",
+        None => "round complete",
+    };
+    let event = if r.match_over { "match" } else { "round" };
+    format!("   {team} win the {event}   /   {reason}   ")
+}
+
+fn objective(s: &Session) -> String {
+    let (Some(r), Some(p)) = (s.round, s.me()) else {
+        return String::new();
+    };
+    if r.phase == Phase::Warmup {
+        return "   Warmup   /   Waiting for both teams   ".into();
     }
-    let msg = match r.bomb {
-        BombView::Carried(id) if id == p.id => "You have the bomb   |   Hold E at a site",
-        BombView::Dropped(pos) if p.team == 0 && pos.distance(p.body.pos) < 2.5 => {
-            "E   Recover bomb"
+    if r.phase == Phase::Buy {
+        if p.rifle.magazine == sendit_sim::rifle::MAGAZINE
+            && p.armor == sendit_sim::Loadout::Armored.armor()
+        {
+            return "   Rifle kit equipped   ".into();
         }
-        BombView::Planted(_, pos) if p.team == 1 && pos.distance(p.body.pos) < 2.5 => {
-            "Hold E   Defuse"
+        if p.money < KIT_COST {
+            return format!(
+                "   Rifle kit  ${KIT_COST}   /   Need ${}   ",
+                KIT_COST - p.money
+            );
         }
-        BombView::Planted(_, _) => "Bomb planted",
-        _ if r.phase == Phase::Buy => "B   Buy rifle",
+        return format!("   B   Buy rifle kit + 50 armor   ${KIT_COST}   ");
+    }
+    if r.action_by == Some(p.id) && r.progress > 0. {
+        let verb = if r.phase == Phase::Planted {
+            "Defusing"
+        } else {
+            "Planting"
+        };
+        return format!(
+            "   {verb}    {:3.0}%   |   Hold E   ",
+            (r.progress * 100.).clamp(0., 100.)
+        );
+    }
+    let prompt = match r.bomb {
+        BombView::Carried(id) if id == p.id => {
+            if let Some(site) = s
+                .map
+                .sites
+                .iter()
+                .find(|site| site.pos.distance(p.body.pos) <= site.radius)
+            {
+                format!("Site {}   |   Hold E while still to plant", site.name)
+            } else {
+                "Carrying bomb   |   G  Drop".into()
+            }
+        }
+        BombView::Carried(id) if p.team == 0 => format!("Bomb carrier   {}", s.name(id)),
+        BombView::Dropped(pos) if p.team == 0 && can_reach_objective(&s.map, &p.body, pos) => {
+            "E   Recover bomb".into()
+        }
+        BombView::Dropped(_) if p.team == 0 => "Bomb dropped".into(),
+        BombView::Planted(idx, pos) => {
+            let site = s
+                .map
+                .sites
+                .get(idx as usize)
+                .map_or("?", |s| s.name.as_str());
+            if p.team == 1 && can_reach_objective(&s.map, &p.body, pos) {
+                format!("Site {site}   |   Hold E while still to defuse")
+            } else {
+                format!("Bomb planted   /   Site {site}")
+            }
+        }
         _ => return String::new(),
     };
-    format!("   {msg}   ")
+    format!("   {prompt}   ")
 }
 
 fn telemetry(s: &Session) -> String {

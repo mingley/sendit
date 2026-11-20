@@ -7,6 +7,7 @@ const HELP: &str = "sendit-client [--connect HOST:PORT] [--name NAME] [--passwor
   --record FILE              Record live fixed-tick inputs
   --replay FILE              Play the first player's input track
   --benchmark SECONDS        Measure an occupied match after three seconds of warmup
+  --live-input               Use live mouse/keyboard during a graphical benchmark
   --expect-players COUNT     Minimum match occupancy for benchmarking (default 2)
   --output FILE              Write the benchmark report as JSON
   --mute                     Disable game sounds
@@ -25,6 +26,7 @@ pub struct Options {
     pub replay: Option<PathBuf>,
     pub benchmark: Option<f32>,
     pub expect_players: usize,
+    pub live_input: bool,
     pub output: PathBuf,
     pub mute: bool,
 }
@@ -42,6 +44,7 @@ impl Default for Options {
             replay: None,
             benchmark: None,
             expect_players: 2,
+            live_input: false,
             output: "client-benchmark.json".into(),
             mute: false,
         }
@@ -56,6 +59,10 @@ impl Options {
             if flag == "-h" || flag == "--help" {
                 println!("{HELP}");
                 return Ok(None);
+            }
+            if flag == "--live-input" {
+                opts.live_input = true;
+                continue;
             }
             if flag == "--mute" {
                 opts.mute = true;
@@ -89,7 +96,12 @@ impl Options {
         if opts.benchmark.is_some_and(|v| !v.is_finite() || v <= 0.0) || opts.expect_players == 0 {
             return Err("benchmark duration and population must be positive".into());
         }
-        if opts.record.is_some() && (opts.replay.is_some() || opts.benchmark.is_some()) {
+        if opts.live_input && (opts.benchmark.is_none() || opts.replay.is_some()) {
+            return Err("--live-input requires --benchmark and live mouse/keyboard control".into());
+        }
+        if opts.record.is_some()
+            && (opts.replay.is_some() || (opts.benchmark.is_some() && !opts.live_input))
+        {
             return Err("recording requires live human input".into());
         }
         Ok(Some(opts))

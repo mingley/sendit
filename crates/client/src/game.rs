@@ -15,7 +15,7 @@ use sendit_sim::{
     Arena, Body, Input, Mode, Phase, PlayerView, Rifle, RoundView, Shot, Tuning,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::ErrorKind,
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
     time::{Duration, Instant},
@@ -33,6 +33,9 @@ pub struct Session {
     pub mode: Mode,
     pub tuning: Tuning,
     pub players: Vec<PlayerView>,
+    names: HashMap<u16, String>,
+    pub scoreboard: bool,
+    tab_since: Option<Instant>,
     previous: Vec<PlayerView>,
     previous_tick: u32,
     pub server_tick: u32,
@@ -104,6 +107,9 @@ impl Session {
             mode: Mode::Practice,
             tuning: Tuning::default(),
             players: vec![],
+            names: HashMap::new(),
+            scoreboard: false,
+            tab_since: None,
             previous: vec![],
             previous_tick: 0,
             server_tick: 0,
@@ -150,6 +156,13 @@ impl Session {
 
     pub fn me(&self) -> Option<&PlayerView> {
         self.players.iter().find(|v| Some(v.id) == self.id)
+    }
+
+    pub fn name(&self, id: u16) -> String {
+        self.names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("Player {id}"))
     }
 
     fn can_move(&self) -> bool {
@@ -402,6 +415,25 @@ pub fn receive(
                     }
                 }
             }
+            ServerMsg::Roster { players } => {
+                s.names = players
+                    .into_iter()
+                    .map(|(id, name)| {
+                        let clean: String = name
+                            .chars()
+                            .take(24)
+                            .map(|ch| {
+                                if ch.is_ascii_graphic() || ch == ' ' {
+                                    ch
+                                } else {
+                                    '?'
+                                }
+                            })
+                            .collect();
+                        (id, clean)
+                    })
+                    .collect();
+            }
             ServerMsg::Snapshot {
                 tick,
                 players,
@@ -512,13 +544,14 @@ pub fn sample(
         window.cursor_options.grab_mode = grab;
         window.cursor_options.visible = !s.captured;
     }
-    let live = s.captured && s.replay.is_none() && opts.benchmark.is_none();
+    let live = s.captured && s.replay.is_none() && (opts.benchmark.is_none() || opts.live_input);
     if live {
         if let Some(mut stamp) = stamp {
             if movement != Vec2::ZERO
                 || keys.get_just_pressed().next().is_some()
                 || keys.get_just_released().next().is_some()
-                || buttons.is_changed()
+                || buttons.get_just_pressed().next().is_some()
+                || buttons.get_just_released().next().is_some()
             {
                 stamp.0 = Some(Instant::now());
             }
@@ -542,9 +575,24 @@ pub fn sample(
     s.input.buy |= live && keys.just_pressed(KeyCode::KeyB);
     s.input.drop_bomb |= live && keys.just_pressed(KeyCode::KeyG);
     s.input.interact = live && keys.pressed(KeyCode::KeyE);
-    if keys.just_pressed(KeyCode::Tab) && s.me().is_some_and(|p| p.hp == 0) {
-        s.next_spectator();
+    let dead = s.me().is_some_and(|p| p.hp == 0);
+    if keys.just_pressed(KeyCode::Tab) {
+        s.tab_since = Some(Instant::now());
     }
+    if keys.just_released(KeyCode::Tab) {
+        if dead
+            && s.tab_since
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(220))
+        {
+            s.next_spectator();
+        }
+        s.tab_since = None;
+    }
+    s.scoreboard = window.focused
+        && keys.pressed(KeyCode::Tab)
+        && (!dead
+            || s.tab_since
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(220)));
     if keys.just_pressed(KeyCode::F5) && matches!(s.mode, Mode::Practice | Mode::Surf) {
         if let (Some((body, yaw)), Some(life)) = (s.spawn, s.me().map(|p| p.life)) {
             s.send(&ClientMsg::Reset {
@@ -612,10 +660,10 @@ pub fn predict(
     while s.accumulator >= DT {
         s.accumulator -= DT;
         s.sequence = s.sequence.wrapping_add(1);
-        let automated = s.replay.is_some() || opts.benchmark.is_some();
+        let automated = s.replay.is_some() || (opts.benchmark.is_some() && !opts.live_input);
         let input = if let Some(replay) = &s.replay {
             replay.input_at(0, s.replay_tick)
-        } else if opts.benchmark.is_some() {
+        } else if opts.benchmark.is_some() && !opts.live_input {
             benchmark_command(s.replay_tick)
         } else {
             s.input

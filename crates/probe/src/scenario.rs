@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn pace(next: &mut Instant) {
+pub(crate) fn pace(next: &mut Instant) {
     *next += PERIOD;
     let now = Instant::now();
     if *next > now {
@@ -19,7 +19,7 @@ fn pace(next: &mut Instant) {
     }
 }
 
-fn connect(
+pub(crate) fn connect(
     addr: &str,
     password: &str,
     net: Impairment,
@@ -56,7 +56,7 @@ fn connect(
     Ok(peers)
 }
 
-fn aim(from: Vec3, to: Vec3) -> Input {
+pub(crate) fn aim(from: Vec3, to: Vec3) -> Input {
     let delta = (to + Vec3::Y * 1.1) - (from + Vec3::Y * EYE_HEIGHT);
     Input {
         yaw: delta.x.atan2(-delta.z),

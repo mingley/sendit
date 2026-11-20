@@ -264,7 +264,10 @@ pub fn sync_players(
     for p in s.players.iter().filter(|v| Some(v.id) != s.id) {
         let (pos, yaw) = s.remote_pose(p);
         let transform = Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(-yaw));
-        let visibility = if p.hp == 0 || s.spectate == Some(p.id) {
+        let team_spectator_waiting = s.mode == sendit_sim::Mode::Competitive
+            && s.spectate.is_none()
+            && s.me().is_some_and(|me| me.hp == 0);
+        let visibility = if p.hp == 0 || s.spectate == Some(p.id) || team_spectator_waiting {
             Visibility::Hidden
         } else {
             Visibility::Inherited
@@ -329,6 +332,9 @@ pub fn place_camera(
     {
         (pos, yaw) = s.remote_pose(subject);
         pitch = subject.pitch;
+    } else if let Some(me) = s.me().filter(|me| me.hp == 0) {
+        yaw = me.yaw;
+        pitch = me.pitch;
     } else {
         // Extrapolate at most one tick, then clip the visual offset against the map.
         // The fixed-tick body used by prediction and hit registration is never shifted.

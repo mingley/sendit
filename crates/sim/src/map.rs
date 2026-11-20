@@ -116,6 +116,7 @@ impl Arena {
         }
         let arena = match name {
             "drill" => Self::from_json(include_bytes!("../../../maps/drill.json"))?,
+            "relay" => Self::from_json(include_bytes!("../../../maps/relay.json"))?,
             _ => {
                 let dir = std::env::var_os("SENDIT_MAP_DIR")
                     .map(PathBuf::from)
@@ -302,5 +303,55 @@ mod tests {
         let mut drill = Arena::load("drill").unwrap();
         drill.boxes[0].max = drill.boxes[0].min;
         assert!(drill.validate().is_err());
+    }
+
+    #[test]
+    fn relay_has_two_walkable_attacks_and_a_shorter_defender_rotation_to_each_site() {
+        use crate::{step, Body, Input, Tuning, TICK_RATE};
+        let arena = Arena::load("relay").unwrap();
+        let tune = Tuning::default();
+        let walk = |spawn: Vec3, route: &[Vec3]| {
+            let mut body = Body::at(spawn);
+            let mut ticks = 0u32;
+            for &waypoint in route {
+                for _ in 0..TICK_RATE * 8 {
+                    let offset = waypoint - body.pos;
+                    if offset.length() < 0.23 {
+                        break;
+                    }
+                    let input = Input {
+                        yaw: offset.x.atan2(-offset.z),
+                        forward: 1.0,
+                        ..Input::default()
+                    };
+                    step(&mut body, input, &arena, &tune);
+                    ticks += 1;
+                }
+                assert!(
+                    body.pos.distance(waypoint) < 0.23,
+                    "blocked from {waypoint:?} at {:?}",
+                    body.pos
+                );
+            }
+            ticks
+        };
+        for team in [0, 1] {
+            assert_eq!(arena.spawns.iter().filter(|s| s.team == team).count(), 5);
+        }
+        assert_eq!(arena.sites.len(), 2);
+        for site in &arena.sites {
+            let attacker = arena.spawns[0].pos;
+            let defender = arena.spawns[1].pos;
+            let outer_attack = walk(
+                attacker,
+                &[Vec3::new(site.pos.x, 0.0, attacker.z), site.pos],
+            );
+            let defender_route = walk(
+                defender,
+                &[Vec3::new(site.pos.x, 0.0, defender.z), site.pos],
+            );
+            assert!(defender_route + TICK_RATE < outer_attack);
+            walk(attacker, &[Vec3::new(0.0, 0.0, -4.7), site.pos]);
+        }
     }
 }

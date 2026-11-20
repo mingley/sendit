@@ -69,7 +69,9 @@ fn main() -> AppExit {
             scene::sync_map,
             scene::sync_players,
             scene::place_camera,
+            hud::scale,
             hud::update,
+            hud::scoreboard::update,
             audio::play,
         )
             .chain(),

@@ -17,6 +17,7 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Session {
     id: u16,
+    name: String,
     token: u64,
     last_packet: Instant,
     last_seq: u32,
@@ -84,6 +85,7 @@ pub struct Host {
     socket: UdpSocket,
     sessions: BTreeMap<SocketAddr, Session>,
     trace: Option<TraceWriter>,
+    roster_changed: bool,
     inputs: Vec<(u16, Command)>,
     pub traffic: Traffic,
 }
@@ -91,7 +93,8 @@ pub struct Host {
 impl Host {
     pub fn bind(config: Config) -> Result<Self, String> {
         let arena = Arena::load(&config.map)?;
-        let world = World::new(arena, config.mode, config.tuning);
+        let mut world = World::new(arena, config.mode, config.tuning);
+        world.set_dm_loadout(config.dm_loadout);
         let socket =
             UdpSocket::bind(config.bind).map_err(|e| format!("bind {}: {e}", config.bind))?;
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -108,6 +111,7 @@ impl Host {
             config,
             trace,
             sessions: BTreeMap::new(),
+            roster_changed: false,
             traffic: Traffic::default(),
         })
     }
@@ -141,8 +145,18 @@ impl Host {
         }
     }
 
-    fn broadcast_snapshot(&mut self) -> io::Result<()> {
-        let data = encode(&self.snapshot()).map_err(io::Error::other)?;
+    fn roster(&self) -> ServerMsg {
+        let mut players: Vec<_> = self
+            .sessions
+            .values()
+            .map(|s| (s.id, s.name.clone()))
+            .collect();
+        players.sort_unstable_by_key(|(id, _)| *id);
+        ServerMsg::Roster { players }
+    }
+
+    fn broadcast(&mut self, message: ServerMsg) -> io::Result<()> {
+        let data = encode(&message).map_err(io::Error::other)?;
         for addr in self.sessions.keys() {
             match self.socket.send_to(&data, addr) {
                 Ok(size) => self.traffic.sent += size as u64,
@@ -160,6 +174,7 @@ impl Host {
         password: String,
         now: Instant,
     ) -> io::Result<()> {
+        let name = name.trim();
         let rejected = if version != PROTOCOL {
             Some("protocol version mismatch")
         } else if password != self.config.password {
@@ -188,10 +203,12 @@ impl Host {
             if !self.world.add(id) {
                 return self.send(addr, ServerMsg::Rejected("no free player slot".into()));
             }
+            self.roster_changed = true;
             self.sessions.insert(
                 addr,
                 Session {
                     id,
+                    name: name.chars().take(24).collect(),
                     token,
                     last_packet: now,
                     last_seq: 0,
@@ -267,6 +284,7 @@ impl Host {
                     if self.sessions.get(&addr).is_some_and(|s| s.token == token) {
                         if let Some(session) = self.sessions.remove(&addr) {
                             self.world.remove(session.id);
+                            self.roster_changed = true;
                             println!("leave id={}", session.id);
                         }
                     }
@@ -282,6 +300,7 @@ impl Host {
         self.sessions.retain(|_, session| {
             if now.duration_since(session.last_packet) >= SESSION_TIMEOUT {
                 self.world.remove(session.id);
+                self.roster_changed = true;
                 println!("timeout id={}", session.id);
                 return false;
             }
@@ -297,8 +316,14 @@ impl Host {
             }
         }
         self.world.advance(&self.inputs);
-        if self.world.tick % SNAPSHOT_INTERVAL == 0 && !self.sessions.is_empty() {
-            self.broadcast_snapshot()?;
+        if !self.sessions.is_empty() {
+            if self.world.tick % SNAPSHOT_INTERVAL == 0 {
+                self.broadcast(self.snapshot())?;
+            }
+            if self.roster_changed || self.world.tick % sendit_sim::TICK_RATE == 0 {
+                self.broadcast(self.roster())?;
+                self.roster_changed = false;
+            }
         }
         Ok(())
     }
@@ -320,6 +345,7 @@ mod tests {
     fn reorder_and_redundancy_never_replay_consumed_commands() {
         let mut session = Session {
             id: 1,
+            name: "test".into(),
             token: 1,
             last_packet: Instant::now(),
             last_seq: u32::MAX - 2,
@@ -408,6 +434,11 @@ mod tests {
         let ServerMsg::Welcome { token, .. } = receive(&alice) else {
             panic!("expected welcome")
         };
+        assert!(matches!(receive(&alice), ServerMsg::Snapshot { .. }));
+        let ServerMsg::Roster { players } = receive(&alice) else {
+            panic!("expected roster")
+        };
+        assert_eq!(players, vec![(1, "test".into())]);
         request(&mut host, &bob, ClientMsg::Leave { token });
         assert_eq!(host.connected(), 1);
         request(&mut host, &bob, join("test-room"));

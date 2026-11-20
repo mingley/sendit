@@ -1,6 +1,6 @@
 use sendit_sim::{
     wire::{decode, encode, ClientMsg, Command, ServerMsg, INPUT_REDUNDANCY, PROTOCOL},
-    Arena, Body, Input, Mode, PlayerView, Tuning,
+    Arena, Body, Input, Mode, PlayerView, RoundView, Tuning,
 };
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -85,6 +85,7 @@ impl Queue {
 pub struct Frame {
     pub tick: u32,
     pub players: Vec<PlayerView>,
+    pub round: RoundView,
 }
 
 impl Frame {
@@ -281,9 +282,18 @@ impl Peer {
                     self.mode = mode;
                     self.tuning = tuning;
                 }
-                ServerMsg::Snapshot { tick, players, .. } => {
-                    self.snapshot(Frame { tick, players }, arena)
-                }
+                ServerMsg::Snapshot {
+                    tick,
+                    players,
+                    round,
+                } => self.snapshot(
+                    Frame {
+                        tick,
+                        players,
+                        round,
+                    },
+                    arena,
+                ),
                 ServerMsg::Rejected(reason) => {
                     return Err(format!("server rejected join or input: {reason}"))
                 }

@@ -324,7 +324,7 @@ fn sample(
             "present_mode":format!("{:?}",window.present_mode),
             "mode":format!("{:?}",session.mode),"map":book.map,"players_min":book.players_min,"players_max":book.players_max,
             "expected_players":opts.expect_players,"warmup_seconds":WARMUP.as_secs(),"measured_seconds":(drain-book.start.unwrap()).as_secs_f64(),
-            "workload":session.replay.as_ref().map_or("deterministic-client-input",|r|r.header.source.as_str()),
+            "workload":session.replay.as_ref().map_or(if opts.live_input {"live-device-input"} else {"deterministic-client-input"},|r|r.header.source.as_str()),
             "frame_interval_ms":stats(&book.wall), "one_percent_low_fps":low_one_percent(&book.wall),
             "one_percent_low_definition":"1000 divided by the mean duration in ms of the slowest ceil(frame count / 100) intervals",
             "cpu_main_schedule_ms":stats(&book.cpu_main),"cpu_render_schedule_ms":stats(&book.render),

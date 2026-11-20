@@ -1,8 +1,8 @@
 use crate::{metrics, mode, Options};
 use sendit_sim::{
-    replay::Trace,
+    replay::{Trace, TraceWriter},
     wire::{decode, encode, ClientMsg, Command, ServerMsg, INPUT_REDUNDANCY},
-    Arena, Input, Mode, Tuning, World,
+    Arena, Input, Mode, Phase, Tuning, World,
 };
 use serde_json::{json, Value};
 use std::{collections::VecDeque, f32::consts::TAU, time::Instant};
@@ -32,6 +32,31 @@ fn scripted(slot: usize, tick: u32) -> Input {
         buy: phase % 83 == 0,
         ..Input::default()
     }
+}
+
+/// Freeze the benchmark's synthetic client inputs so the UDP host and the
+/// in-process simulation can be driven from exactly the same traces.
+pub fn record_match(mut opts: Options) -> Result<Value, String> {
+    let path = opts.required("--out")?;
+    let map = opts.take("--map").unwrap_or_else(|| "relay".into());
+    let count = opts.value("--players", 10usize)?;
+    let ticks = opts.value("--ticks", 2048u32)?;
+    opts.finish()?;
+    if !(1..=32).contains(&count) || !(1..=MAX_TICKS).contains(&ticks) {
+        return Err("players must be 1..32 and ticks 1..10000000".into());
+    }
+    Arena::load(&map)?;
+    let mut writer = TraceWriter::create(&path, &map, "scripted-match-v1")
+        .map_err(|e| format!("{path}: {e}"))?;
+    for tick in 0..ticks {
+        for slot in 0..count {
+            writer
+                .record(tick, slot as u16 + 1, scripted(slot, tick))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(json!({"source":"scripted-match-v1","saved":path,"ticks":ticks,"tracks":count,"map":map}))
 }
 
 fn occupy(world: &mut World, count: usize) -> Result<(), String> {
@@ -119,6 +144,8 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
     let mut cpu_start = None;
     let mut latest_snapshot = 0;
     let mut snapshots = 0;
+    let mut phase_ticks = [0u32; 5];
+    let mut shots = 0u64;
     for tick in 0..(warmup + ticks) {
         if tick == warmup {
             started = Instant::now();
@@ -178,6 +205,21 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
         }
         if measuring {
             samples.push(begin.elapsed().as_nanos() as u64);
+            let phase = match world.round_view().phase {
+                Phase::Warmup => 0,
+                Phase::Buy => 1,
+                Phase::Live => 2,
+                Phase::Planted => 3,
+                Phase::Ended => 4,
+            };
+            phase_ticks[phase] += 1;
+            shots += (1..=count as u16)
+                .filter(|&id| {
+                    world
+                        .view(id)
+                        .is_some_and(|p| p.shot_tick == world.tick && p.shot.is_some())
+                })
+                .count() as u64;
         }
     }
     let wall = started.elapsed().as_secs_f64();
@@ -197,6 +239,8 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
         "map":map,"mode":mode_name,"players":count,"workload":scenario,
         "tick_hz":TICK_HZ,"snapshot_hz":TICK_HZ/SNAPSHOT_INTERVAL,"warmup_ticks":warmup,
         "measured_ticks":ticks,"snapshots_serialized":snapshots,"simulated_seconds":simulated_seconds,
+        "phase_ticks":{"warmup":phase_ticks[0],"buy":phase_ticks[1],"live":phase_ticks[2],"planted":phase_ticks[3],"ended":phase_ticks[4]},
+        "rifle_shots":shots,"ending_round":world.round_view().number,"ending_score":world.round_view().score,
         "deadline_ms":to_ms(DEADLINE_NS),"work_over_deadline_ticks":missed,
         "tick_ms":{"p50":to_ms(metrics::percentile(&samples,50)),"p95":to_ms(metrics::percentile(&samples,95)),
             "p99":to_ms(metrics::percentile(&samples,99)),"max":to_ms(*samples.last().unwrap())},

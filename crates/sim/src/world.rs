@@ -1,6 +1,7 @@
 //! Authoritative player lifetimes, damage and bounded target rewind.
 use crate::map::Spawn;
 use crate::motion::{HEIGHT, RADIUS};
+use crate::rules::{credit, Loadout, RoundResult, RuleState, KILL_REWARD, START_MONEY, TEAM_CAP};
 use crate::{
     shot_seed, step, Arena, Body, Command, Input, Rifle, Shot, Tuning, Vec3, MAX_REWIND, TICK_RATE,
 };
@@ -44,6 +45,10 @@ pub struct RoundView {
     pub number: u16,
     pub bomb: BombView,
     pub progress: f32,
+    pub action_by: Option<u16>,
+    pub winner: Option<u8>,
+    pub result: Option<RoundResult>,
+    pub match_over: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -55,6 +60,7 @@ pub struct PlayerView {
     pub yaw: f32,
     pub pitch: f32,
     pub hp: u8,
+    pub armor: u8,
     pub ack: u32,
     pub life: u32,
     pub shot: Option<Shot>,
@@ -73,6 +79,7 @@ pub(crate) struct Player {
     pub received_at: u32,
     seen_tick: u32,
     pub died_at: u32,
+    pub playing_round: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +102,7 @@ pub struct World {
     pub tick: u32,
     pub(crate) players: BTreeMap<u16, Player>,
     pub(crate) round: RoundView,
+    pub(crate) rules: RuleState,
     history: Vec<Frame>,
     shots: Vec<(u16, u32, Shot)>,
 }
@@ -108,6 +116,7 @@ impl World {
             tick: 0,
             players: BTreeMap::new(),
             round: RoundView::default(),
+            rules: RuleState::default(),
             history: (0..=MAX_REWIND).map(|_| Frame::default()).collect(),
             shots: Vec::new(),
         }
@@ -129,25 +138,36 @@ impl World {
             .filter(|p| p.view.team == team)
             .map(|p| p.spawn_slot)
             .collect();
+        if self.mode == Mode::Competitive && used.len() >= TEAM_CAP {
+            return false;
+        }
         used.sort_unstable();
         let slot = (0..=used.len()).find(|i| !used.contains(i)).unwrap_or(0);
         let Some(spawn) = self.spawn(team, slot) else {
             return false;
         };
+        let competitive = self.mode == Mode::Competitive;
+        let waiting = competitive
+            && matches!(
+                self.round.phase,
+                Phase::Live | Phase::Planted | Phase::Ended
+            );
+        let loadout = self.spawn_loadout();
         let view = PlayerView {
             id,
             team,
             body: Body::at(spawn.pos),
-            rifle: Rifle::default(),
+            rifle: loadout.rifle(),
             yaw: spawn.yaw,
             pitch: 0.,
-            hp: 100,
+            hp: if waiting { 0 } else { 100 },
+            armor: loadout.armor(),
             ack: 0,
             life: 1,
             shot: None,
             shot_tick: 0,
             rewind_ticks: 0,
-            money: 0,
+            money: if competitive { START_MONEY } else { 0 },
             kills: 0,
             deaths: 0,
             armed: true,
@@ -164,6 +184,7 @@ impl World {
                 received_at: self.tick,
                 seen_tick: self.tick,
                 died_at: 0,
+                playing_round: competitive && self.round.phase == Phase::Buy,
             },
         );
         true
@@ -180,6 +201,7 @@ impl World {
     }
 
     pub fn remove(&mut self, id: u16) {
+        self.release_bomb(id);
         self.players.remove(&id);
         for frame in &mut self.history {
             frame.poses.retain(|pose| pose.id != id);
@@ -211,6 +233,7 @@ impl World {
         let Some(spawn) = self.spawn(current.view.team, current.spawn_slot) else {
             return;
         };
+        let loadout = self.spawn_loadout();
         let player = self.players.get_mut(&id).unwrap();
         let v = &mut player.view;
         v.life = v.life.wrapping_add(1);
@@ -218,7 +241,8 @@ impl World {
         v.yaw = spawn.yaw;
         v.pitch = 0.;
         v.hp = 100;
-        v.rifle = Rifle::default();
+        v.rifle = loadout.rifle();
+        v.armor = loadout.armor();
         v.shot = None;
         v.shot_tick = 0;
         v.rewind_ticks = 0;
@@ -229,6 +253,14 @@ impl World {
         };
         player.received_at = self.tick;
         player.seen_tick = self.tick;
+    }
+
+    fn spawn_loadout(&self) -> Loadout {
+        match self.mode {
+            Mode::Competitive => Loadout::Light,
+            Mode::Deathmatch => self.rules.dm_loadout,
+            _ => Loadout::Standard,
+        }
     }
 
     pub fn view(&self, id: u16) -> Option<&PlayerView> {
@@ -261,10 +293,11 @@ impl World {
 
         self.shots.clear();
         let mut respawns = Vec::new();
+        let mut falls = Vec::new();
         for (&id, player) in &mut self.players {
             let view = &mut player.view;
             if view.hp == 0 {
-                if self.mode != Mode::Competitive
+                if (self.mode != Mode::Competitive || self.round.phase == Phase::Warmup)
                     && self.tick.wrapping_sub(player.died_at) >= TICK_RATE
                 {
                     respawns.push(id);
@@ -288,9 +321,21 @@ impl World {
             }
             view.yaw = input.yaw;
             view.pitch = input.pitch;
+            if self.mode == Mode::Competitive
+                && matches!(self.round.phase, Phase::Buy | Phase::Ended)
+            {
+                if self.round.phase == Phase::Buy && input.buy {
+                    crate::rules::buy_kit(view);
+                }
+                continue;
+            }
             step(&mut view.body, input, &self.arena, &self.tuning);
             if view.body.pos.y < -40.0 {
-                respawns.push(id);
+                if self.mode == Mode::Competitive && self.round.phase != Phase::Warmup {
+                    falls.push(id);
+                } else {
+                    respawns.push(id);
+                }
                 continue;
             }
             input.fire &= view.armed && self.mode != Mode::Surf;
@@ -317,6 +362,10 @@ impl World {
             self.respawn(id);
         }
 
+        for id in falls {
+            self.eliminate(id, None);
+        }
+
         let index = self.tick as usize % self.history.len();
         let frame = &mut self.history[index];
         frame.tick = self.tick;
@@ -336,6 +385,9 @@ impl World {
             if let Some(victim) = self.trace(id, time, shot) {
                 self.damage(id, victim, 34);
             }
+        }
+        if self.mode == Mode::Competitive {
+            self.advance_round();
         }
     }
 
@@ -367,18 +419,50 @@ impl World {
     }
 
     pub(crate) fn damage(&mut self, shooter: u16, target: u16, amount: u8) {
+        if self.mode == Mode::Competitive
+            && self
+                .view(shooter)
+                .zip(self.view(target))
+                .is_some_and(|(a, b)| a.team == b.team)
+        {
+            return;
+        }
+        self.apply_damage(target, amount, Some(shooter));
+    }
+
+    pub(crate) fn apply_damage(&mut self, target: u16, amount: u8, killer: Option<u16>) {
         let Some(player) = self.players.get_mut(&target) else {
             return;
         };
         if player.view.hp == 0 {
             return;
         }
-        player.view.hp = player.view.hp.saturating_sub(amount);
+        let absorbed = (amount / 3).min(player.view.armor);
+        player.view.armor -= absorbed;
+        if amount - absorbed >= player.view.hp {
+            self.eliminate(target, killer);
+        } else {
+            player.view.hp -= amount - absorbed;
+        }
+    }
+
+    fn eliminate(&mut self, target: u16, killer: Option<u16>) {
+        let Some(player) = self.players.get_mut(&target) else {
+            return;
+        };
         if player.view.hp == 0 {
-            player.view.deaths = player.view.deaths.saturating_add(1);
-            player.died_at = self.tick;
-            if let Some(attacker) = self.players.get_mut(&shooter) {
-                attacker.view.kills = attacker.view.kills.saturating_add(1);
+            return;
+        }
+        player.view.hp = 0;
+        player.view.deaths = player.view.deaths.saturating_add(1);
+        player.died_at = self.tick;
+        self.release_bomb(target);
+        if let Some(attacker) = killer.and_then(|id| self.players.get_mut(&id)) {
+            attacker.view.kills = attacker.view.kills.saturating_add(1);
+            if self.mode == Mode::Competitive
+                && matches!(self.round.phase, Phase::Live | Phase::Planted)
+            {
+                credit(&mut attacker.view, KILL_REWARD);
             }
         }
     }

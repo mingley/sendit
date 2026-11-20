@@ -1,4 +1,5 @@
 mod net;
+mod rules;
 mod scenario;
 
 use net::Impairment;
@@ -14,10 +15,12 @@ use std::time::Duration;
 const HELP: &str = "Sendit UDP probe
 
   sendit-probe verify [--server PATH]
+  sendit-probe verify-rules [--server PATH]
   sendit-probe smoke [--connect HOST:PORT] [--latency-ms N] [--jitter-ms N] [--loss-pct N] [--seed N]
   sendit-probe load [--connect HOST:PORT] [--players N] [--seconds N] [--replay FILE]
 
 verify launches two fresh drill servers, testing both LAN conditions and a seeded impaired link.
+verify-rules tests competitive bomb play and deathmatch loadouts on separate local servers.
 smoke expects an empty practice server on the drill map. Latency and jitter apply in each direction.
 load occupies a live server. Without an input trace it uses a synthetic movement and firing pattern.
 Use --password-env NAME to join a protected smoke or load server.";
@@ -95,16 +98,10 @@ impl Drop for Server {
     }
 }
 
-fn start_server(path: &Path) -> Result<(Server, SocketAddr), String> {
+fn start_server(path: &Path, options: &[&str]) -> Result<(Server, SocketAddr), String> {
     let child = Command::new(path)
-        .args([
-            "--bind",
-            "127.0.0.1:0",
-            "--map",
-            "drill",
-            "--mode",
-            "practice",
-        ])
+        .args(["--bind", "127.0.0.1:0"])
+        .args(options)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -150,12 +147,14 @@ fn run() -> Result<(), String> {
                 seed: 137,
             };
             for (label, profile) in [("local", Impairment::default()), ("impaired", impaired)] {
-                let (_server, addr) = start_server(&o.server)?;
+                let (_server, addr) =
+                    start_server(&o.server, &["--map", "drill", "--mode", "practice"])?;
                 eprintln!("Testing {label} on {addr}");
                 scenario::smoke(&addr.to_string(), "", profile)?;
             }
             Ok(())
         }
+        "verify-rules" => rules::verify(&o.server),
         "smoke" => scenario::smoke(&o.addr, &o.password, o.net),
         "load" => scenario::load(
             &o.addr,

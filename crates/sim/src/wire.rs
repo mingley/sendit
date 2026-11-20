@@ -4,7 +4,7 @@ use crate::{Input, Mode, PlayerView, RoundView, Tuning};
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 pub const MAX_PACKET: usize = 60_000;
 /// At most this many recent, unacknowledged commands accompany each client tick.
 pub const INPUT_REDUNDANCY: usize = 6;
@@ -53,6 +53,9 @@ pub enum ServerMsg {
         tick: u32,
         players: Vec<PlayerView>,
         round: RoundView,
+    },
+    Roster {
+        players: Vec<(u16, String)>,
     },
     Rejected(String),
     Pong {

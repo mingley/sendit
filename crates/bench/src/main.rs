@@ -10,6 +10,7 @@ const USAGE: &str = "\
 Sendit benchmark and input replay
   sendit-bench peek [--friction N]
   sendit-bench record-peek --out FILE
+  sendit-bench record-match --out FILE [--map relay] [--players 10] [--ticks 2048]
   sendit-bench replay --file FILE [--friction N]
   sendit-bench server [--players 10] [--ticks 8192] [--warmup 512]
                       [--map drill] [--mode practice] [--friction N]
@@ -128,6 +129,7 @@ fn run() -> Result<Option<Value>, String> {
                 server::replay_run(arena, tuning, &trace)?
             }
         }
+        "record-match" => server::record_match(opts)?,
         "server" => server::run(opts)?,
         _ => return Err(format!("unknown command {command}\n{USAGE}")),
     };

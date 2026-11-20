@@ -64,7 +64,14 @@ fn run() -> Result<(), String> {
             skipped = (after.duration_since(next).as_nanos() / TICK.as_nanos()) as u64;
             next += Duration::from_secs_f64(TICK.as_secs_f64() * skipped as f64);
         }
-        stats.observe(after - before, late, skipped, host.connected(), 0);
+        stats.observe(
+            after - before,
+            late,
+            skipped,
+            host.connected(),
+            0,
+            host.world.round_view().phase,
+        );
         if host.config.report_ticks > 0 && ticks % host.config.report_ticks == 0 {
             stats.report(ticks, &host.traffic);
             host.traffic = Default::default();

@@ -1,0 +1,66 @@
+{
+  "benchmark": "authoritative-fixed-loop",
+  "deadline_ms": 7.8125,
+  "ending_round": 1,
+  "ending_score": [
+    0,
+    0
+  ],
+  "map": "relay",
+  "measured_ticks": 1024,
+  "mode": "competitive",
+  "payload_bytes_per_player_per_second": {
+    "downlink": 34260.125,
+    "scope": "serialized UDP payload only; latest unacknowledged commands (up to 6), immediate LAN acknowledgments at 32 Hz; no join/loss/IP headers",
+    "uplink": 10368.0
+  },
+  "peak_rss_kib": 3104,
+  "phase_ticks": {
+    "buy": 256,
+    "ended": 0,
+    "live": 768,
+    "planted": 0,
+    "warmup": 0
+  },
+  "platform": {
+    "available_parallelism": 4,
+    "build_profile": "release",
+    "cgroup_cpu_max": "400000 100000",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "renderer": "headless",
+    "resolution": null,
+    "system": "Linux 6.18.57 x86_64",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "players": 10,
+  "process_cpu_pct_of_one_core_including_driver": 99.99394693055163,
+  "process_cpu_seconds_including_driver": 0.010143000000000006,
+  "rifle_shots": 171,
+  "rss_kib": 3104,
+  "simulated_seconds": 8.0,
+  "snapshot_hz": 32,
+  "snapshots_serialized": 256,
+  "tick_hz": 128,
+  "tick_ms": {
+    "max": 0.104187,
+    "p50": 0.00713,
+    "p95": 0.010336,
+    "p99": 0.021222
+  },
+  "tick_scope": "decode received input, authoritative world tick and serialize shared snapshot; no socket or scheduler wait",
+  "tick_work_pct_of_realtime_budget": 0.0885434125,
+  "wall_seconds_fast_forward": 0.010143614,
+  "warmup_ticks": 1024,
+  "work_over_deadline_ticks": 0,
+  "workload": {
+    "fan_out": "slot modulo track count, repeated tracks offset by 97 ticks; loops at trace end",
+    "source": "scripted-match-v1",
+    "trace_ticks": 4096,
+    "trace_tracks": 10
+  },
+  "measurement_build": "cargo build --locked --release -p sendit-bench -p sendit-server -p sendit-probe",
+  "reproduce": [
+    "target/release/sendit-bench record-match --map relay --players 10 --ticks 4096 --out relay.jsonl",
+    "target/release/sendit-bench server --map relay --mode competitive --players 10 --warmup 1024 --ticks 1024 --replay relay.jsonl"
+  ]
+}

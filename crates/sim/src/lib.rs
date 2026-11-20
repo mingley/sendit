@@ -4,6 +4,7 @@ pub mod map;
 pub mod motion;
 pub mod replay;
 pub mod rifle;
+pub mod rules;
 pub mod wire;
 pub mod world;
 
@@ -11,6 +12,7 @@ pub use glam::Vec3;
 pub use map::Arena;
 pub use motion::{step, Body, Input, Tuning};
 pub use rifle::{Rifle, Shot};
+pub use rules::{Loadout, RoundResult};
 pub use wire::Command;
 pub use world::{BombView, Mode, Phase, PlayerView, RoundView, World};
 

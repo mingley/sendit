@@ -3,7 +3,7 @@ use bevy::{
     audio::{SpatialScale, Volume},
     prelude::*,
 };
-use sendit_sim::{BombView, TICK_RATE};
+use sendit_sim::{BombView, Phase, RoundResult, TICK_RATE};
 use std::{
     collections::HashMap,
     f32::consts::TAU,
@@ -22,7 +22,22 @@ pub enum Cue {
     Step,
     Damage,
     Objective,
+    Use,
+    Armed,
+    Defused,
+    Detonated,
 }
+
+const CUES: [Cue; 8] = [
+    Cue::Shot,
+    Cue::Step,
+    Cue::Damage,
+    Cue::Objective,
+    Cue::Use,
+    Cue::Armed,
+    Cue::Defused,
+    Cue::Detonated,
+];
 
 impl Cue {
     fn duration(self) -> f32 {
@@ -31,6 +46,10 @@ impl Cue {
             Self::Step => 0.13,
             Self::Damage => 0.16,
             Self::Objective => 0.15,
+            Self::Use => 0.13,
+            Self::Armed => 0.27,
+            Self::Defused => 0.42,
+            Self::Detonated => 0.48,
         }
     }
 
@@ -41,6 +60,9 @@ impl Cue {
             Self::Step => (0.44, 6.0, 23.0),
             Self::Damage => (0.45, 1.0, 1.0),
             Self::Objective => (0.45, 11.0, 45.0),
+            Self::Use => (0.4, 4.0, 13.0),
+            Self::Armed | Self::Defused => (0.5, 15., 65.),
+            Self::Detonated => (0.63, 32., 100.),
         }
     }
 }
@@ -54,10 +76,14 @@ struct Emission {
 #[derive(Resource)]
 pub struct Sound {
     enabled: bool,
-    clips: Option<[Handle<AudioSource>; 4]>,
+    clips: Option<[Handle<AudioSource>; CUES.len()]>,
     queue: Vec<Emission>,
     strides: HashMap<u16, f32>,
     last_pulse: Option<(u16, u32)>,
+    phase: Option<(u16, Phase)>,
+    actor: Option<u16>,
+    last_use: Option<Instant>,
+    planted_pos: Vec3,
 }
 
 impl Sound {
@@ -68,6 +94,10 @@ impl Sound {
             queue: Vec::new(),
             strides: HashMap::new(),
             last_pulse: None,
+            phase: None,
+            actor: None,
+            last_use: None,
+            planted_pos: Vec3::ZERO,
         }
     }
 
@@ -96,6 +126,44 @@ impl Sound {
 
     fn objective(&mut self, session: &Session) {
         let Some(round) = session.round else { return };
+        if let BombView::Planted(_, pos) = round.bomb {
+            self.planted_pos = pos;
+        }
+        let stage = (round.number, round.phase);
+        if let Some(prior) = self.phase {
+            if prior != stage {
+                if round.phase == Phase::Planted {
+                    self.emit(Cue::Armed, self.planted_pos, true);
+                }
+                if round.phase == Phase::Ended {
+                    let cue = match round.result {
+                        Some(RoundResult::Defused) => Some(Cue::Defused),
+                        Some(RoundResult::Detonated) => Some(Cue::Detonated),
+                        _ => None,
+                    };
+                    if let Some(cue) = cue {
+                        self.emit(cue, self.planted_pos, true);
+                    }
+                }
+            }
+        }
+        self.phase = Some(stage);
+        if round.action_by != self.actor {
+            if let Some(player) = session
+                .players
+                .iter()
+                .find(|p| Some(p.id) == round.action_by)
+            {
+                if self
+                    .last_use
+                    .is_none_or(|when| when.elapsed() > Duration::from_millis(250))
+                {
+                    self.emit(Cue::Use, player.body.eye(), Some(player.id) != session.id);
+                    self.last_use = Some(Instant::now());
+                }
+            }
+            self.actor = round.action_by;
+        }
         let BombView::Planted(_, point) = round.bomb else {
             self.last_pulse = None;
             return;
@@ -116,16 +184,14 @@ impl Sound {
     }
 }
 
-/// Synthesize the four original mono clips once. Rodio spatializes the same source at each emitter.
+/// Synthesize the original mono clips once. Rodio spatializes the same source at each emitter.
 pub fn setup(mut sound: ResMut<Sound>, mut assets: ResMut<Assets<AudioSource>>) {
     if sound.enabled {
-        sound.clips = Some(
-            [Cue::Shot, Cue::Step, Cue::Damage, Cue::Objective].map(|cue| {
-                assets.add(AudioSource {
-                    bytes: synth(cue).into(),
-                })
-            }),
-        );
+        sound.clips = Some(CUES.map(|cue| {
+            assets.add(AudioSource {
+                bytes: synth(cue).into(),
+            })
+        }));
     }
 }
 
@@ -229,6 +295,20 @@ fn synth(cue: Cue) -> Vec<u8> {
             Cue::Damage => {
                 (0.42 * tone(182.0) + 0.24 * tone(211.0) + 0.27 * filtered) * decay(24.0)
             }
+            Cue::Use => 0.45 * filtered * decay(50.) + 0.35 * tone(420.) * decay(75.),
+            Cue::Armed => 0.55 * (TAU * (390. * t + 680. * t * t)).sin() * decay(6.),
+            Cue::Defused => {
+                let pitch = if t < 0.14 {
+                    523.25
+                } else if t < 0.28 {
+                    659.25
+                } else {
+                    783.99
+                };
+                let envelope = (std::f32::consts::PI * (t % 0.14) / 0.14).sin().powi(2);
+                0.52 * tone(pitch) * envelope
+            }
+            Cue::Detonated => (0.56 * filtered + 0.41 * tone(63.0) + 0.23 * tone(47.)) * decay(8.),
             Cue::Objective => {
                 let tap = |start: f32, hz: f32| {
                     let phase = t - start;
@@ -257,7 +337,7 @@ mod tests {
 
     #[test]
     fn synthesized_clips_decode_and_have_signal() {
-        for cue in [Cue::Shot, Cue::Step, Cue::Damage, Cue::Objective] {
+        for cue in CUES {
             let source = AudioSource {
                 bytes: synth(cue).into(),
             };

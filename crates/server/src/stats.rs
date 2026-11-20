@@ -1,3 +1,4 @@
+use sendit_sim::Phase;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,7 @@ pub struct Window {
     // Sparse microsecond buckets retain long stalls without an overflow bin.
     histogram: BTreeMap<u64, u64>,
     samples: u64,
+    phase_ticks: [u64; 5],
     maximum_us: f64,
     late: u64,
     skipped: u64,
@@ -71,6 +73,7 @@ impl Window {
             cpu_start: cpu_seconds(),
             histogram: BTreeMap::new(),
             samples: 0,
+            phase_ticks: [0; 5],
             maximum_us: 0.0,
             late: 0,
             skipped: 0,
@@ -91,10 +94,19 @@ impl Window {
         skipped: u64,
         humans: usize,
         bots: usize,
+        phase: Phase,
     ) {
         let us = duration.as_nanos().div_ceil(1000) as u64;
         *self.histogram.entry(us).or_default() += 1;
         self.samples += 1;
+        let phase_index = match phase {
+            Phase::Warmup => 0,
+            Phase::Buy => 1,
+            Phase::Live => 2,
+            Phase::Planted => 3,
+            Phase::Ended => 4,
+        };
+        self.phase_ticks[phase_index] += 1;
         self.maximum_us = self.maximum_us.max(duration.as_secs_f64() * 1e6);
         self.late += u64::from(late);
         self.skipped += skipped;
@@ -133,8 +145,9 @@ impl Window {
         let rate = |bytes: u64| {
             (self.human_seconds > 0.0).then(|| bytes as f64 / self.human_seconds / 1024.0)
         };
+        let [warmup, buy, live, planted, ended] = self.phase_ticks;
         println!(
-            "stats tick={tick} ticks={} players={} players_min={} players_max={} humans={} human_seconds={:.3} player_seconds={:.3} tick_p50_us={:.1} tick_p95_us={:.1} tick_p99_us={:.1} tick_max_us={:.1} missed_ticks={} skipped_slots={} cpu_pct={} rss_kib={} rx_bytes={} tx_bytes={} rx_kib_s_per_human={} tx_kib_s_per_human={} send_drops={}",
+            "stats tick={tick} ticks={} players={} players_min={} players_max={} humans={} human_seconds={:.3} player_seconds={:.3} tick_p50_us={:.1} tick_p95_us={:.1} tick_p99_us={:.1} tick_max_us={:.1} missed_ticks={} skipped_slots={} cpu_pct={} rss_kib={} rx_bytes={} tx_bytes={} rx_kib_s_per_human={} tx_kib_s_per_human={} send_drops={} warmup_ticks={warmup} buy_ticks={buy} live_ticks={live} planted_ticks={planted} ended_ticks={ended}",
             self.samples, self.players, self.players_min, self.players_max, self.humans, self.human_seconds, self.player_seconds, self.percentile_us(50), self.percentile_us(95), self.percentile_us(99),
             self.maximum_us, self.late + self.skipped, self.skipped, field(cpu),
             rss_kib().map(|rss| rss.to_string()).unwrap_or_else(|| "n/a".into()),

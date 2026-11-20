@@ -44,6 +44,7 @@ pub struct Shot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rifle {
+    pub magazine: u8,
     pub ammo: u8,
     pub reload_left: u16,
     pub cooldown_left: u16,
@@ -55,6 +56,7 @@ pub struct Rifle {
 impl Default for Rifle {
     fn default() -> Self {
         Self {
+            magazine: MAGAZINE,
             ammo: MAGAZINE,
             reload_left: 0,
             cooldown_left: 0,
@@ -77,6 +79,15 @@ fn sample(mut key: u32) -> f32 {
 }
 
 impl Rifle {
+    pub fn with_magazine(magazine: u8) -> Self {
+        let magazine = magazine.clamp(1, MAGAZINE);
+        Self {
+            magazine,
+            ammo: magazine,
+            ..Self::default()
+        }
+    }
+
     pub fn accurate(&self, body: &Body, tuning: &Tuning) -> bool {
         body.grounded
             && body.speed() <= tuning.accuracy_speed
@@ -122,9 +133,9 @@ impl Rifle {
             if self.reload_left != 0 {
                 return None;
             }
-            self.ammo = MAGAZINE;
+            self.ammo = self.magazine;
         }
-        if self.ammo < MAGAZINE && (input.reload || (input.fire && self.ammo == 0)) {
+        if self.ammo < self.magazine && (input.reload || (input.fire && self.ammo == 0)) {
             self.reload_left = tuning.reload_ticks.max(1);
             return None;
         }
