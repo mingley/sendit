@@ -3432,8 +3432,10 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "rodio",
+ "sendit-server",
  "sendit-sim",
  "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

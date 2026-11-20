@@ -35,6 +35,16 @@ pub enum Field {
     Stats,
     Cash,
     Armor,
+    LobbyBots,
+    LobbySkill,
+    LobbyControls,
+    LobbyAction,
+}
+
+#[derive(Component, Clone, Copy)]
+pub(crate) enum HudLayer {
+    Play,
+    Lobby,
 }
 #[derive(Component)]
 pub struct Reticle;
@@ -61,6 +71,76 @@ fn card() -> Node {
     }
 }
 
+fn spawn_local_lobby(commands: &mut Commands) {
+    commands
+        .spawn((
+            HudLayer::Lobby,
+            Node {
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.),
+                height: Val::Percent(100.),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            ZIndex(12),
+            BackgroundColor(Color::srgba(0.025, 0.045, 0.05, 0.34)),
+        ))
+        .with_children(|screen| {
+            screen
+                .spawn((
+                    Node {
+                        width: Val::Px(452.),
+                        max_width: Val::Percent(88.),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(12.),
+                        border: UiRect::left(Val::Px(4.)),
+                        padding: UiRect::all(Val::Px(24.)),
+                        ..default()
+                    },
+                    BorderColor(amber()),
+                    BackgroundColor(Color::srgb_u8(24, 35, 37)),
+                ))
+                .with_children(|panel| {
+                    panel.spawn(text("Play bot deathmatch", 29., Color::WHITE));
+                    for (value, hint) in [
+                        (Field::LobbyBots, "Left / Right arrows"),
+                        (Field::LobbySkill, "Down / Up arrows"),
+                    ] {
+                        panel
+                            .spawn(Node {
+                                justify_content: JustifyContent::SpaceBetween,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(12.),
+                                ..default()
+                            })
+                            .with_children(|row| {
+                                row.spawn((text("", 18., Color::WHITE), value));
+                                row.spawn(text(hint, 16., ash()));
+                            });
+                    }
+                    panel.spawn((text("", 16., ash()), Field::LobbyControls));
+                    panel
+                        .spawn((
+                            Node {
+                                align_self: AlignSelf::FlexStart,
+                                margin: UiRect::top(Val::Px(5.)),
+                                padding: UiRect::axes(Val::Px(16.), Val::Px(8.)),
+                                ..default()
+                            },
+                            BackgroundColor(amber()),
+                        ))
+                        .with_children(|button| {
+                            button.spawn((
+                                text("", 17., Color::srgb_u8(24, 33, 32)),
+                                Field::LobbyAction,
+                            ));
+                        });
+                });
+        });
+}
+
 pub fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -68,6 +148,7 @@ pub fn setup(
 ) {
     commands
         .spawn((
+            HudLayer::Play,
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(22.),
@@ -84,6 +165,7 @@ pub fn setup(
         });
     commands
         .spawn((
+            HudLayer::Play,
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(24.),
@@ -96,13 +178,16 @@ pub fn setup(
             row.spawn((text("", 14., ash()), Field::Link));
         });
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(22.),
-            width: Val::Percent(100.),
-            justify_content: JustifyContent::Center,
-            ..default()
-        })
+        .spawn((
+            HudLayer::Play,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(22.),
+                width: Val::Percent(100.),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+        ))
         .with_children(|row| {
             row.spawn((
                 text("", 18., Color::WHITE),
@@ -113,6 +198,7 @@ pub fn setup(
 
     commands
         .spawn((
+            HudLayer::Play,
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(24.),
@@ -129,6 +215,7 @@ pub fn setup(
         });
     commands
         .spawn((
+            HudLayer::Play,
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(24.),
@@ -228,6 +315,7 @@ pub fn setup(
                 BackgroundColor(ink()),
             ));
         });
+    spawn_local_lobby(&mut commands);
     scoreboard::spawn(&mut commands);
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::from_length(0.075))),
@@ -242,17 +330,55 @@ pub fn setup(
     ));
 }
 
+#[derive(Default)]
+pub(crate) struct ReturnNotice {
+    dead: Option<(u16, u32)>,
+    respawned: Option<Instant>,
+}
+
+impl ReturnNotice {
+    fn observe(&mut self, player: Option<&sendit_sim::PlayerView>, now: Instant) -> bool {
+        let Some(me) = player else {
+            self.dead = None;
+            self.respawned = None;
+            return false;
+        };
+        if me.hp == 0 {
+            self.dead = Some((me.id, me.life));
+            self.respawned = None;
+        } else if let Some((id, life)) = self.dead.take() {
+            if id == me.id && life != me.life {
+                self.respawned = Some(now);
+            }
+        }
+        self.respawned
+            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(600))
+    }
+}
+
 pub fn update(
     s: Res<Session>,
     opts: Res<Options>,
-    mut fields: Query<(&Field, &mut Text)>,
+    mut fields: Query<(&Field, &mut Text, &mut TextFont)>,
+    mut layers: Query<(&HudLayer, &mut Node)>,
     mut impact: Query<(&mut Transform, &mut Visibility), With<Impact>>,
     mut reticle: Query<&mut Visibility, (With<Reticle>, Without<Impact>)>,
     mut last: Local<Option<Instant>>,
+    mut return_notice: Local<ReturnNotice>,
 ) {
     let me = s.me();
+    let lobby = s.local_lobby;
+    let back_in_play =
+        return_notice.observe(me.filter(|_| s.mode == Mode::Deathmatch), Instant::now());
+    for (layer, mut node) in &mut layers {
+        let shown = matches!(layer, HudLayer::Lobby) == lobby;
+        let display = if shown { Display::Flex } else { Display::None };
+        if node.display != display {
+            node.display = display;
+        }
+    }
     if let Ok(mut v) = reticle.get_single_mut() {
-        v.set_if_neq(if me.is_some_and(|p| p.hp > 0) {
+        v.set_if_neq(if !lobby && me.is_some_and(|p| p.hp > 0) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -287,7 +413,7 @@ pub fn update(
     let mode = match s.mode {
         Mode::Practice => "AIM PRACTICE",
         Mode::Competitive => "COMPETITIVE",
-        Mode::Deathmatch => "DEATHMATCH",
+        Mode::Deathmatch => "FREE-FOR-ALL",
         Mode::Surf => "SURF",
     };
     let course = if s.mode == Mode::Surf {
@@ -295,8 +421,44 @@ pub fn update(
     } else {
         Default::default()
     };
-    for (field, mut label) in &mut fields {
+    for (field, mut label, mut font) in &mut fields {
+        let deathmatch = s.mode == Mode::Deathmatch;
+        let size = match field {
+            Field::Action => Some(if deathmatch { 21. } else { 16. }),
+            Field::Round => Some(if deathmatch { 21. } else { 18. }),
+            _ => None,
+        };
+        if let Some(size) = size {
+            if font.font_size != size {
+                font.font_size = size;
+            }
+        }
         let value = match field {
+            Field::LobbyBots if lobby => format!(
+                "{} {}",
+                opts.bots,
+                if opts.bots == 1 { "bot" } else { "bots" }
+            ),
+            Field::LobbySkill if lobby => format!("Skill {:.0}%", opts.bot_skill * 100.),
+            Field::LobbyControls if lobby => {
+                if s.status.is_empty() {
+                    "WASD move   /   Mouse aim\nLeft click fire   /   R reload".into()
+                } else {
+                    s.status.clone()
+                }
+            }
+            Field::LobbyAction if lobby => if !s.scene_ready {
+                "Loading arena..."
+            } else if !s.status.is_empty() {
+                "Click to retry"
+            } else {
+                "Click to play"
+            }
+            .into(),
+            Field::LobbyBots | Field::LobbySkill | Field::LobbyControls | Field::LobbyAction => {
+                String::new()
+            }
+            _ if lobby => String::new(),
             Field::Map => {
                 if s.id.is_none() {
                     "CONNECTING".into()
@@ -318,6 +480,14 @@ pub fn update(
             Field::Armor => me
                 .filter(|p| p.armor > 0)
                 .map_or_else(String::new, |p| format!("{} ARMOR", p.armor)),
+            Field::Link if s.mode == Mode::Deathmatch && me.is_some() => {
+                let rivals = s.players.len().saturating_sub(1);
+                format!(
+                    "{rivals} {}   |   {} ms",
+                    if rivals == 1 { "RIVAL" } else { "RIVALS" },
+                    s.rtt_ms.map_or_else(|| "-".into(), |v| format!("{v:.0}"))
+                )
+            }
             Field::Link => format!(
                 "{} {}   |   {} ms",
                 s.players.len(),
@@ -371,6 +541,13 @@ pub fn update(
                 "RIFLE"
             }
             .into(),
+            Field::Round if s.mode == Mode::Deathmatch => me.map_or_else(String::new, |p| {
+                format!(
+                    "   {} {}   ",
+                    p.kills,
+                    if p.kills == 1 { "KILL" } else { "KILLS" }
+                )
+            }),
             Field::Round if s.mode == Mode::Surf => course.0.clone(),
             Field::Round => {
                 if s.mode == Mode::Competitive {
@@ -396,6 +573,18 @@ pub fn update(
                 }
             }
             Field::Action if s.scoreboard || s.show_help => String::new(),
+            Field::Action if s.mode == Mode::Deathmatch => {
+                let killed = s
+                    .hit_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(1050));
+                let damaged = s
+                    .damage_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(450));
+                me.map_or("", |p| {
+                    deathmatch_notice(p.hp, p.kills, killed, damaged, back_in_play)
+                })
+                .into()
+            }
             Field::Action if s.mode == Mode::Surf => course.1.clone(),
             Field::Action => {
                 if s.mode == Mode::Competitive && s.round.is_some_and(|r| r.phase == Phase::Ended) {
@@ -451,6 +640,18 @@ pub fn update(
                     String::new()
                 }
             }
+            Field::Help if s.mode == Mode::Deathmatch && s.show_help && !s.scoreboard => {
+                "   FREE-FOR-ALL
+
+   WASD   Move          Mouse   Aim
+   LMB     Fire              R            Reload
+   Space  Jump            Tab       Hold for scores
+   Esc       Release mouse
+   F3         Shot telemetry
+
+   F1         Close   "
+                    .into()
+            }
             Field::Help => {
                 if s.show_help && !s.scoreboard {
                     "   CONTROLS\n\n   WASD     Move             Mouse     Aim\n   Space     Jump             LMB         Fire\n   R             Reload          Esc           Release mouse\n   E             Plant / defuse (hold) or recover\n   G             Drop bomb    B              Buy rifle\n   Tab         Hold for scores, tap to cycle spectator\n   F3           Shot telemetry\n   F5           Reset practice or surf\n\n   F1           Close   ".into()
@@ -473,6 +674,34 @@ pub fn scale(windows: Query<&Window, With<PrimaryWindow>>, mut ui: ResMut<UiScal
         if ui.0 != scale {
             ui.0 = scale;
         }
+    }
+}
+
+fn deathmatch_notice(
+    hp: u8,
+    kills: u16,
+    kill: bool,
+    damaged: bool,
+    respawned: bool,
+) -> &'static str {
+    if hp == 0 {
+        if kill && kills == 1 {
+            "   First kill  /  Respawning   "
+        } else if kill {
+            "   Kill confirmed  /  Respawning   "
+        } else {
+            "   Eliminated  /  Respawning   "
+        }
+    } else if kill && kills == 1 {
+        "   First kill   "
+    } else if kill {
+        "   Kill confirmed   "
+    } else if damaged {
+        "   Hit taken   "
+    } else if respawned {
+        "   Back in play   "
+    } else {
+        ""
     }
 }
 
@@ -594,4 +823,44 @@ fn telemetry(s: &Session) -> String {
         );
     }
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn deathmatch_respawn_feedback_requires_a_confirmed_new_life() {
+        let mut game = sendit_sim::World::new(
+            sendit_sim::Arena::load("aim").unwrap(),
+            Mode::Deathmatch,
+            sendit_sim::Tuning::default(),
+        );
+        assert!(game.add(1));
+        let mut p = *game.view(1).unwrap();
+        let mut notice = ReturnNotice::default();
+        let now = Instant::now();
+        assert!(!notice.observe(Some(&p), now));
+        p.hp = 0;
+        assert!(!notice.observe(Some(&p), now));
+        p.hp = 100;
+        p.life += 1;
+        assert!(notice.observe(Some(&p), now));
+        assert!(!notice.observe(Some(&p), now + Duration::from_secs(1)));
+        assert!(!notice.observe(None, now + Duration::from_secs(2)));
+    }
+    #[test]
+    fn first_kill_feedback_survives_a_trade() {
+        assert_eq!(
+            deathmatch_notice(0, 1, true, true, false).trim(),
+            "First kill  /  Respawning"
+        );
+        assert_eq!(
+            deathmatch_notice(100, 1, true, false, false).trim(),
+            "First kill"
+        );
+        assert_eq!(
+            deathmatch_notice(60, 0, false, true, false).trim(),
+            "Hit taken"
+        );
+    }
 }

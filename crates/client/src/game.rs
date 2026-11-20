@@ -25,6 +25,12 @@ use std::{
 #[derive(Resource)]
 pub struct Session {
     socket: UdpSocket,
+    remote_address: String,
+    local_host: Option<sendit_server::LocalMatch>,
+    pub local_lobby: bool,
+    pub scene_ready: bool,
+    announced_player: bool,
+    suppress_fire_until_release: bool,
     token: u64,
     epoch_tick: u32,
     epochs: u32,
@@ -78,21 +84,26 @@ pub struct Session {
 
 impl Session {
     pub fn open(opts: &Options) -> Result<Self, String> {
-        let address: SocketAddr = opts
-            .address
-            .to_socket_addrs()
-            .map_err(|e| e.to_string())?
-            .next()
-            .ok_or("host has no address")?;
-        let socket = UdpSocket::bind(if address.is_ipv4() {
-            "0.0.0.0:0"
+        let socket = if opts.local_match {
+            UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?
         } else {
-            "[::]:0"
-        })
-        .map_err(|e| e.to_string())?;
-        socket.connect(address).map_err(|e| e.to_string())?;
+            let address: SocketAddr = opts
+                .address
+                .to_socket_addrs()
+                .map_err(|e| e.to_string())?
+                .next()
+                .ok_or("host has no address")?;
+            let socket = UdpSocket::bind(if address.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            })
+            .map_err(|e| e.to_string())?;
+            socket.connect(address).map_err(|e| e.to_string())?;
+            socket
+        };
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let map = Arena::load("drill")?;
+        let map = Arena::load(if opts.local_match { "aim" } else { "drill" })?;
         let spawn = map.spawns.first().ok_or("drill has no spawn")?;
         let body = Body::at(spawn.pos);
         let input = Input {
@@ -102,6 +113,12 @@ impl Session {
         let replay = opts.replay.as_deref().map(Trace::load).transpose()?;
         Ok(Self {
             socket,
+            remote_address: opts.address.clone(),
+            local_host: None,
+            local_lobby: opts.local_match,
+            scene_ready: false,
+            announced_player: false,
+            suppress_fire_until_release: false,
             token: 0,
             epoch_tick: 0,
             epochs: 0,
@@ -111,7 +128,11 @@ impl Session {
             map_revision: 1,
             server_map: String::new(),
             map_ready: false,
-            mode: Mode::Practice,
+            mode: if opts.local_match {
+                Mode::Deathmatch
+            } else {
+                Mode::Practice
+            },
             tuning: Tuning::default(),
             players: vec![],
             names: HashMap::new(),
@@ -126,7 +147,11 @@ impl Session {
             last_ping: None,
             rtt_ms: None,
             round: None,
-            status: format!("Connecting to {}", opts.address),
+            status: if opts.local_match {
+                String::new()
+            } else {
+                format!("Connecting to {}", opts.address)
+            },
             rejected: false,
             input,
             tap_fire: false,
@@ -152,6 +177,45 @@ impl Session {
             damage_at: None,
             hit_at: None,
         })
+    }
+
+    fn join(&mut self, opts: &Options) {
+        self.send(&ClientMsg::Join {
+            version: wire::PROTOCOL,
+            name: opts.name.clone(),
+            password: if self.local_host.is_some() {
+                String::new()
+            } else {
+                opts.password.clone()
+            },
+        });
+        self.last_join = Some(Instant::now());
+    }
+
+    fn start_local(&mut self, opts: &Options) -> Result<(), String> {
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|trace| trace.header.map != "aim")
+        {
+            return Err(
+                "for this replay, join a host running its recorded map with --connect".into(),
+            );
+        }
+        let host = sendit_server::LocalMatch::start(opts.bots, opts.bot_skill)?;
+        self.socket
+            .connect(host.addr())
+            .map_err(|e| e.to_string())?;
+        self.remote_address = host.addr().to_string();
+        self.local_host = Some(host);
+        self.local_lobby = false;
+        self.status = "Joining local match".into();
+        self.join(opts);
+        println!(
+            "QUICKPLAY_STARTED addr={} bots={} skill={:.2}",
+            self.remote_address, opts.bots, opts.bot_skill
+        );
+        Ok(())
     }
 
     fn send(&self, message: &ClientMsg) {
@@ -231,8 +295,10 @@ impl Session {
         self.replay_tick = 0;
         self.map_ready = sendit_sim::map::is_builtin(map);
         self.download = if self.map_ready {
-            self.map = Arena::load(map)?;
-            self.map_revision += 1;
+            if self.epochs != 1 || self.map.name != map {
+                self.map = Arena::load(map)?;
+                self.map_revision += 1;
+            }
             self.status = "Waiting for match state".into();
             None
         } else {
@@ -309,6 +375,10 @@ impl Session {
     }
 
     fn next_spectator(&mut self) {
+        if self.mode != Mode::Competitive {
+            self.spectate = None;
+            return;
+        }
         let Some(me) = self.me() else { return };
         let team = me.team;
         let players: Vec<_> = self
@@ -404,6 +474,14 @@ impl Session {
             return;
         }
         self.reset_life = None;
+        if self.local_host.is_some() && !self.announced_player {
+            println!(
+                "QUICKPLAY_PLAYING id={} players={}",
+                self.id.unwrap(),
+                self.players.len()
+            );
+            self.announced_player = true;
+        }
         let changed_life = old_self.is_none_or(|p| p.0 != life);
         if changed_life {
             self.spawn = Some((body, yaw));
@@ -453,6 +531,9 @@ pub fn receive(
     mut exit: EventWriter<AppExit>,
     mut bytes: Local<Vec<u8>>,
 ) {
+    if s.local_lobby {
+        return;
+    }
     let now = Instant::now();
     if bytes.is_empty() {
         bytes.resize(wire::MAX_PACKET + 1, 0u8);
@@ -463,7 +544,7 @@ pub fn receive(
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => {
                 if s.id.is_none() {
-                    s.status = format!("Waiting for {} | {e}", opts.address)
+                    s.status = format!("Waiting for {} | {e}", s.remote_address)
                 };
                 break;
             }
@@ -587,19 +668,14 @@ pub fn receive(
         s.players.clear();
         s.pending.clear();
         s.last_snapshot = None;
-        s.status = format!("Reconnecting to {}", opts.address);
+        s.status = format!("Reconnecting to {}", s.remote_address);
     }
     if s.id.is_none()
         && !s.rejected
         && s.last_join
             .is_none_or(|i| i.elapsed() > Duration::from_millis(750))
     {
-        s.send(&ClientMsg::Join {
-            version: wire::PROTOCOL,
-            name: opts.name.clone(),
-            password: opts.password.clone(),
-        });
-        s.last_join = Some(now);
+        s.join(&opts);
     }
     if let Some(download) = &mut s.download {
         let requests = download.requests(now);
@@ -652,10 +728,13 @@ pub fn receive(
 }
 
 pub fn sample(
+    mut keyboard_events: EventReader<bevy::input::keyboard::KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut mouse: EventReader<MouseMotion>,
-    opts: Res<Options>,
+    mut opts: ResMut<Options>,
+    ready: Option<Res<crate::LobbyRender>>,
+    mut exit: EventWriter<AppExit>,
     mut s: ResMut<Session>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     stamp: Option<ResMut<InputClock>>,
@@ -664,6 +743,47 @@ pub fn sample(
         return;
     };
     let movement = mouse.read().map(|e| e.delta).sum::<Vec2>();
+    if s.local_lobby {
+        use bevy::input::keyboard::Key;
+        for key in keyboard_events
+            .read()
+            .filter(|key| window.focused && key.state.is_pressed() && !key.repeat)
+        {
+            let logical = match key.logical_key {
+                Key::ArrowLeft => KeyCode::ArrowLeft,
+                Key::ArrowRight => KeyCode::ArrowRight,
+                Key::ArrowDown => KeyCode::ArrowDown,
+                Key::ArrowUp => KeyCode::ArrowUp,
+                _ => key.key_code,
+            };
+            match logical {
+                KeyCode::ArrowLeft => opts.bots = opts.bots.saturating_sub(1).max(1),
+                KeyCode::ArrowRight => opts.bots = (opts.bots + 1).min(9),
+                KeyCode::ArrowUp => {
+                    opts.bot_skill = ((opts.bot_skill * 10.).round() + 1.).min(10.) / 10.
+                }
+                KeyCode::ArrowDown => {
+                    opts.bot_skill = ((opts.bot_skill * 10.).round() - 1.).max(0.) / 10.
+                }
+                _ => (),
+            }
+        }
+        if !ready.is_some_and(|flag| flag.click_ready()) {
+            return;
+        }
+        let automated = opts.replay.is_some() || (opts.benchmark.is_some() && !opts.live_input);
+        if !automated && (!window.focused || !buttons.just_pressed(MouseButton::Left)) {
+            return;
+        }
+        if let Err(e) = s.start_local(&opts) {
+            s.status = format!("Could not start local match | {e}");
+            eprintln!("{}", s.status);
+            if automated {
+                exit.send(AppExit::error());
+            }
+            return;
+        }
+    }
     if keys.just_pressed(KeyCode::F1) {
         s.show_help = !s.show_help;
     }
@@ -673,6 +793,7 @@ pub fn sample(
     let just_grabbed = buttons.just_pressed(MouseButton::Left) && !s.captured && window.focused;
     if just_grabbed {
         s.captured = true;
+        s.suppress_fire_until_release = true;
     }
     if keys.just_pressed(KeyCode::Escape) || !window.focused {
         s.captured = false;
@@ -687,7 +808,7 @@ pub fn sample(
         window.cursor_options.visible = !s.captured;
     }
     let live = s.captured && s.replay.is_none() && (opts.benchmark.is_none() || opts.live_input);
-    if live {
+    if live && !just_grabbed {
         if let Some(mut stamp) = stamp {
             if movement != Vec2::ZERO
                 || keys.get_just_pressed().next().is_some()
@@ -705,11 +826,17 @@ pub fn sample(
     let active = |key| (live && keys.pressed(key)) as u8 as f32;
     s.input.forward = active(KeyCode::KeyW) - active(KeyCode::KeyS);
     s.input.strafe = active(KeyCode::KeyD) - active(KeyCode::KeyA);
-    s.fire_held = live && buttons.pressed(MouseButton::Left) && !just_grabbed;
+    if !buttons.pressed(MouseButton::Left) {
+        s.suppress_fire_until_release = false;
+    }
+    s.fire_held = live && buttons.pressed(MouseButton::Left) && !s.suppress_fire_until_release;
     if !live {
         s.tap_fire = false;
     }
-    s.tap_fire |= live && buttons.just_pressed(MouseButton::Left) && !just_grabbed;
+    s.tap_fire |= live
+        && buttons.just_pressed(MouseButton::Left)
+        && !just_grabbed
+        && !s.suppress_fire_until_release;
     s.input.fire = s.fire_held || s.tap_fire;
     // Latch one-frame presses across render frames shorter than a simulation tick.
     s.input.jump |= live && keys.just_pressed(KeyCode::Space);
@@ -717,7 +844,7 @@ pub fn sample(
     s.input.buy |= live && keys.just_pressed(KeyCode::KeyB);
     s.input.drop_bomb |= live && keys.just_pressed(KeyCode::KeyG);
     s.input.interact = live && keys.pressed(KeyCode::KeyE);
-    let dead = s.me().is_some_and(|p| p.hp == 0);
+    let dead = s.mode == Mode::Competitive && s.me().is_some_and(|p| p.hp == 0);
     if keys.just_pressed(KeyCode::Tab) {
         s.tab_since = Some(Instant::now());
     }
@@ -895,6 +1022,7 @@ pub fn on_exit(mut exit: EventReader<AppExit>, mut s: ResMut<Session>) {
         if s.id.is_some() {
             s.send(&ClientMsg::Leave { token: s.token });
         }
+        drop(s.local_host.take());
     }
 }
 
@@ -903,11 +1031,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_menu_waits_for_a_new_click_and_holding_capture_never_fires() {
+        let opts = Options {
+            bots: 1,
+            ..Options::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(Session::open(&opts).unwrap())
+            .insert_resource(opts)
+            .init_resource::<crate::LobbyRender>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_event::<MouseMotion>()
+            .add_event::<bevy::input::keyboard::KeyboardInput>()
+            .add_event::<AppExit>()
+            .add_systems(Update, sample);
+        app.world_mut().spawn((
+            Window {
+                focused: true,
+                ..default()
+            },
+            PrimaryWindow,
+        ));
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        assert!(app.world().resource::<Session>().local_lobby);
+        assert!(app.world().resource::<Session>().local_host.is_none());
+        app.world_mut()
+            .resource_mut::<crate::LobbyRender>()
+            .0
+            .store(2, std::sync::atomic::Ordering::Release);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.update(); // A button held from loading does not start play.
+        assert!(app.world().resource::<Session>().local_lobby);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .release(MouseButton::Left);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        assert!(!app.world().resource::<Session>().local_lobby);
+        assert!(app.world().resource::<Session>().captured);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.update();
+        assert!(!app.world().resource::<Session>().input.fire);
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .release(MouseButton::Left);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        assert!(app.world().resource::<Session>().input.fire);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Escape);
+        app.update();
+        assert!(!app.world().resource::<Session>().captured);
+        assert!(!app.world().resource::<Session>().local_lobby);
+    }
+
+    #[test]
     fn authoritative_correction_replays_pending_inputs_without_replacing_local_aim() {
         let map = Arena::load("drill").unwrap();
         let mut world = sendit_sim::World::new(map, Mode::Practice, Tuning::default());
         assert!(world.add(7));
-        let mut client = Session::open(&Options::default()).unwrap();
+        let mut client = Session::open(&Options {
+            local_match: false,
+            ..Options::default()
+        })
+        .unwrap();
         let mut audio = Sound::new(false);
         client.id = Some(7);
         client.map_ready = true;
@@ -943,7 +1153,11 @@ mod tests {
 
     #[test]
     fn rotation_to_same_custom_map_rejects_old_welcomes_and_snapshots() {
-        let mut client = Session::open(&Options::default()).unwrap();
+        let mut client = Session::open(&Options {
+            local_match: false,
+            ..Options::default()
+        })
+        .unwrap();
         let tuning = Tuning::default();
         client
             .welcome(2, 11, 100, "custom-arena", Mode::Practice, tuning)
@@ -982,7 +1196,11 @@ mod tests {
             Tuning::default(),
         );
         world.add(9);
-        let mut client = Session::open(&Options::default()).unwrap();
+        let mut client = Session::open(&Options {
+            local_match: false,
+            ..Options::default()
+        })
+        .unwrap();
         let mut audio = Sound::new(false);
         client.id = Some(9);
         client.map_ready = true;

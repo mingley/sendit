@@ -71,6 +71,30 @@ impl Batch {
         let half = Vec3::from(size) * 0.5;
         self.prism(c - half, c + half, |_, _| c.y + half.y);
     }
+    fn floor_stripe(&mut self, x: f32, z: f32, width: f32, length: f32) {
+        let corner = |dx: f32, dz: f32| Vec3::new(x + dx * width, 0.008, z + dz * length);
+        let [a, b, c, d] = [
+            corner(-0.5, -0.5),
+            corner(-0.5, 0.5),
+            corner(0.5, 0.5),
+            corner(0.5, -0.5),
+        ];
+        self.face(a, b, c);
+        self.face(a, c, d);
+    }
+    // Painted sidelines and distance marks give strafing players a reference on the training court.
+    fn aim_markings(&mut self) {
+        for side in [-1., 1.] {
+            self.floor_stripe(side * 12.5, 0., 0.13, 23.);
+            self.floor_stripe(0., side * 11.5, 25.13, 0.13);
+            for z in [-9., -6., -3., 0., 3., 6., 9.] {
+                self.floor_stripe(side * 12.02, z, 0.82, 0.13);
+            }
+            for x in [3.6, 5.5, 7.4, 9.3, 11.2] {
+                self.floor_stripe(side * x, 0., 0.9, 0.15);
+            }
+        }
+    }
     fn mesh(self) -> Mesh {
         Mesh::new(
             PrimitiveTopology::TriangleList,
@@ -241,6 +265,9 @@ pub fn sync_map(
     }
     for r in &s.map.ramps {
         parts[slot(r.material)].prism(r.min, r.max, |x, z| r.height_at(x, z));
+    }
+    if s.map.name == "aim" {
+        parts[slot(Material::Step)].aim_markings();
     }
     for (index, batch) in parts.into_iter().enumerate() {
         if !batch.vertices.is_empty() {
