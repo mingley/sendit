@@ -1,0 +1,9 @@
+[package]
+name = "sendit-probe"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sendit-sim = { path = "../sim" }
+glam = "0.29"
+serde_json = "1"

@@ -1,0 +1,10 @@
+[package]
+name = "sendit-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam = { version = "0.29", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"

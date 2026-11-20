@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/server", "crates/client", "crates/bench", "crates/probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+opt-level = 2
+codegen-units = 32
