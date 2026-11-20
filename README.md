@@ -6,6 +6,20 @@ The provisional client target is 240 FPS at 1920×1080 on a Ryzen 5 7600, GeForc
 
 ![Competitive buy phase on Relay with the two-team scoreboard open](docs/images/relay.png)
 
+## Play the Linux build
+
+[Download the x86-64 Linux build](https://github.com/mingley/sendit/raw/refs/heads/main/dist/sendit-linux-x86_64.tar.xz) · [SHA-256 checksum](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS)
+
+Extract the archive and start a populated match. These binaries were built and tested on Debian 13. The headless server runs as one executable with the four stock maps embedded.
+
+```sh
+tar -xJf sendit-linux-x86_64.tar.xz
+cd sendit-linux-x86_64
+./sendit-server --mode deathmatch --map aim --fill 10
+```
+
+In another terminal in the extracted directory, run `./sendit-client --connect 127.0.0.1:27015`. For a LAN game, use the host's IP address. The examples below use source-build paths. With the download, replace `target/release/` with `./` and pass `--bin-dir .` to the Python benchmark wrapper.
+
 ## Build and join a drill
 
 Install Rust with rustup. On Debian or Ubuntu, install a C toolchain, pkg-config, and ALSA development headers (`build-essential pkg-config libasound2-dev`). To run the desktop game, use an X11 or XWayland display, a Vulkan-capable graphics driver, and an audio output for positional cues. The dedicated server runs without a window or audio device.

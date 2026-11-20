@@ -18,9 +18,10 @@ The host measures wall-clock duration of input and network processing plus each 
 
 ## Replay the same input
 
-Record one track at the desktop or a complete set at the host. A recording replays input under the selected rules and starting conditions. It does not store a video. These commands record and time live input on an occupied host.
+Record one track at the desktop or a complete set at the host. The desktop and host record fixed-tick inputs, original player IDs, sequences, tuning, and initial player state. Offline drill replay reconstructs movement and shots. Independent match events and remote corrections require a live server. These commands record and time live input on an occupied host.
 
 ```sh
+mkdir -p results
 target/release/sendit-client --connect 127.0.0.1:27015 --benchmark 30 --live-input --expect-players 10 --record relay-session.jsonl --output results/live-desktop.json
 python3 scripts/benchmark.py server --mode competitive --map relay --players 10 --seconds 20 --replay relay-session.jsonl
 ```
@@ -50,3 +51,25 @@ target/release/sendit-bench server --map relay --mode competitive --players 10 -
 ```
 
 The live bot-only case includes AI perception, route choice, inputs and the authoritative match. A bot executes inside the server process and sends no UDP traffic. The mixed run adds one actual network peer to measure the traffic a connected player receives with nine bots. The fixed-loop report also times the bot controller itself inside the measured tick.
+
+## Cloud release measurements
+
+These runs used gameplay commit `1ec2bc8`, the release profile, and an AMD EPYC 9V74 host with a four-core CPU quota. Each dedicated-server sample covered 1,536 consecutive occupied ticks on Relay after 12 seconds of warmup. The ten-client replay uses the supplied single desktop fixture with staggered tracks. CPU percentages use one core as 100%.
+
+| Dedicated workload | Tick p50 / p95 / p99 | Missed deadlines | CPU | RSS | UDP up / down per connected client |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 10 desktop-input replay peers | 0.026 / 0.095 / 0.263 ms | 0 | 0.802% | 2,016 KiB | 17.12 / 39.54 KiB/s |
+| 10 server bots | 0.018 / 0.041 / 0.076 ms | 0 | 0.508% | 2,024 KiB | No network clients |
+| 9 bots and 1 network peer | 0.027 / 0.072 / 0.137 ms | 1 | 0.712% | 2,036 KiB | 12.84 / 40.31 KiB/s |
+
+No run discarded a wall-clock slot. The mixed match missed one scheduled deadline even though its p99 work duration was below budget. Across a separate 32,768-tick fast-forward run, p99 time in the ten bots’ controllers was 0.0167 ms. [Replay host](../benchmarks/cloud/relay-desktop-input-udp.json) · [Bot host](../benchmarks/cloud/relay-bot-udp.json) · [Mixed host](../benchmarks/cloud/relay-mixed-udp.json) · [Bot controller measurements](../benchmarks/cloud/relay-bot-fixed.json)
+
+The 1920×1080 desktop run rendered Relay deathmatch with one native client and nine bots. The Vulkan adapter was Mesa llvmpipe on the CPU. With two llvmpipe threads, three seconds of warmup, and 20 seconds of sampling, it produced 200 frame intervals and 178 render-device timestamps. Software-rendered frame p50/p95/p99 was 94.69/131.69/144.02 ms and the 1% low was 6.41 FPS. Main-schedule CPU p50/p95/p99 was 2.12/5.74/8.06 ms and the software render graph was 90.28/130.33/141.15 ms. Sampled input to render submit was 191.14 ms median and 279.08 ms p99. [Raw desktop samples and timing boundaries](../benchmarks/cloud/relay-desktop-1080p.json)
+
+Use this command to repeat the occupied desktop scenario on the reference PC.
+
+```sh
+python3 scripts/benchmark.py client --mode deathmatch --map relay --players 10 --bots 9 --width 1920 --height 1080 --seconds 20 --output results/relay-1080p.json
+```
+
+The RTX 4060 reference run, a genuinely human-recorded match, and physical input-to-photon latency remain unmeasured. Human playtests should cover sensitivity and counter-strafe feel, recoil recovery, footstep direction, silhouette readability, and whether both Relay sites offer competitive timings.

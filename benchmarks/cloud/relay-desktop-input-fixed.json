@@ -1,0 +1,66 @@
+{
+  "benchmark": "authoritative-fixed-loop",
+  "bot_decision_work_ms": null,
+  "bot_seed": 6619,
+  "bot_skill": 0.6499999761581421,
+  "bots": 0,
+  "deadline_ms": 7.8125,
+  "ending_round": 3,
+  "ending_score": [
+    0,
+    2
+  ],
+  "map": "relay",
+  "measured_ticks": 32768,
+  "mode": "competitive",
+  "network_clients": 10,
+  "payload_bytes_per_player_per_second": {
+    "downlink": 38807.94921875,
+    "scope": "payload per simulated network client; up to 6 unacknowledged commands, immediate LAN acknowledgments at 32 Hz; excludes join/loss/IP headers",
+    "uplink": 10368.0
+  },
+  "peak_rss_kib": 2252,
+  "phase_ticks": {
+    "buy": 2560,
+    "ended": 1024,
+    "live": 29184,
+    "planted": 0,
+    "warmup": 0
+  },
+  "platform": {
+    "available_parallelism": 4,
+    "build_profile": "release",
+    "cgroup_cpu_max": "400000 100000",
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "renderer": "headless",
+    "resolution": null,
+    "system": "Linux 6.18.57 x86_64",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "players": 10,
+  "process_cpu_pct_of_one_core_including_driver": 99.99558215420797,
+  "process_cpu_seconds_including_driver": 0.28632599999999997,
+  "rifle_shots": 4825,
+  "rss_kib": 2252,
+  "simulated_seconds": 256.0,
+  "snapshot_hz": 32,
+  "snapshots_serialized": 8192,
+  "tick_hz": 128,
+  "tick_ms": {
+    "max": 1.561665,
+    "p50": 0.005839,
+    "p95": 0.009464,
+    "p99": 0.016255
+  },
+  "tick_scope": "decode received input, run bot control and the authoritative world tick, then serialize any network snapshot; excludes socket and scheduler waits",
+  "tick_work_pct_of_realtime_budget": 0.08196079921875,
+  "wall_seconds_fast_forward": 0.28633865,
+  "warmup_ticks": 1536,
+  "work_over_deadline_ticks": 0,
+  "workload": {
+    "fan_out": "slot modulo track count, repeated tracks offset by 97 ticks; loops at trace end",
+    "source": "automated-desktop-x11",
+    "trace_ticks": 932,
+    "trace_tracks": 1
+  }
+}
