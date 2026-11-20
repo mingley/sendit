@@ -12,7 +12,18 @@ Sendit is an original Rust first-person game. Jump into a free-for-all against b
 
 Click the game window to start on Aim with **five bots at 40% skill**. Before starting, press **Left / Right** to choose 1–9 bots or **Down / Up** to change their skill. The game creates a private match on your machine and works offline.
 
-Move with **WASD**, look with the mouse, **left-click** to fire, **R** to reload and **Space** to jump. Every orange player is a rival. Hold **Tab** for the leaderboard. After a death, you return automatically in one second. **Esc** releases the mouse.
+Move with **WASD**, aim with the mouse, **left-click** to attack, **R** to reload and **Space** to jump. Every orange player is a rival. Hold **Tab** for the leaderboard. After a death, you return in one second with your selected weapon. Press **Esc** at any time to reach **Resume** and **Quit to Desktop**. You can click either button or use the arrow keys and **Enter**.
+
+| Key | Deathmatch weapon | How it plays |
+| --- | --- | --- |
+| **1** | Knife | Swing at an opponent within reach. |
+| **2** | Pistol | Click for each shot. |
+| **3** | M4 | Automatic rifle and starting weapon. |
+| **4** | AK | Slower automatic fire with a stronger kick. |
+| **5** | .50 sniper | Hold the right mouse button to use the scope. Click once per shot. |
+| **6** | SMG | Fast automatic fire and a 36-round magazine. |
+
+Your equipped weapon kicks as it fires. A cross at the reticle confirms a server-registered hit. Incoming damage flashes red on the side the hit came from. Nearby fire has a separate amber indicator. In stereo, your own shots and steps are centered. Other players’ sounds change side as you turn and become quieter and more muffled with distance and cover.
 
 The Mac build requires Apple Silicon and macOS 11 or later. It uses an ad-hoc signature. If macOS asks you to verify the developer, compare `shasum -a 256 ~/Downloads/sendit-macos-arm64.zip` with the published checksum. After attempting to open Sendit, you can approve this app under **System Settings → Privacy & Security → Open Anyway**. On macOS 11–12, use **System Preferences → Security & Privacy → General**. [Download checksums](https://github.com/mingley/sendit/blob/main/dist/SHA256SUMS) · [Apple’s first-open instructions](https://support.apple.com/guide/mac-help/mh40616/mac)
 
@@ -41,13 +52,14 @@ In another terminal on the same machine, join with the following command. A seco
 target/release/sendit-client --connect 127.0.0.1:27015 --name Pilot
 ```
 
-Click to capture the mouse. Use WASD to move, Space to jump, the left mouse button to fire, and R to reload. F5 resets the practice drill, F3 shows authoritative shot diagnostics, F1 shows controls, and Esc releases the cursor. Mouse sensitivity defaults to 0.001 radians per unit of relative motion (`--sensitivity 0.001`). On macOS these deltas come from AppKit and can reflect the system’s pointer settings.
+Click to capture the mouse. F5 resets the practice drill, F3 shows authoritative shot diagnostics, F1 shows controls, and Esc opens the game menu. Mouse sensitivity defaults to 0.001 radians per unit of relative motion (`--sensitivity 0.001`). On macOS these deltas come from AppKit and can reflect the system’s pointer settings.
 
 ## Repeat a peek or a match
 
 ```sh
 cargo test --release --locked --workspace
 target/release/sendit-probe verify --server target/release/sendit-server
+target/release/sendit-probe verify-arsenal --server target/release/sendit-server
 target/release/sendit-bench record-peek --out peek.jsonl
 target/release/sendit-bench replay --file peek.jsonl --friction 5.2
 target/release/sendit-bench replay --file peek.jsonl --friction 8
@@ -56,6 +68,12 @@ python3 scripts/benchmark.py client --players 10 --seconds 30 --width 1920 --hei
 ```
 
 The UDP verifier starts two fresh servers and drives two clients per run, once locally and once with delay, jitter, and loss. The peek fixture records two actors' input tracks with the same approach to the corner, then measures distance and elapsed ticks until each actor can fire a settled first shot. `Tuning::default()` in `crates/sim/src/motion.rs` sets friction, acceleration, movement spread and recovery. `crates/sim/src/rifle.rs` holds the fixed angular recoil pattern. To try the new friction live, start the host with `--friction 8`. Connected clients receive the server's tuning.
+
+The desktop playtest drives the release game with mouse and keyboard events on a private Linux X11 display. Install `xvfb x11-utils libxtst6 tesseract-ocr-eng mesa-vulkan-drivers python3-pil python3-numpy` and run the following after building. The output directory holds screenshots, game logs and the playtest report. The separate `verify-arsenal` command uses two network clients to check weapon selection, damage direction, range, reloads and respawns against the live server.
+
+```sh
+python3 scripts/playtest-desktop.py --bin-dir target/release --output-dir /tmp/sendit-playtest
+```
 
 To capture actual play, add `--record session.jsonl` to a client, or to the server to collect input from every connected player. Choose a new filename for each recording. Use `sendit-client --replay session.jsonl` to replay the first track on a fresh matching map and `python3 scripts/benchmark.py server --map drill --replay session.jsonl` for occupied server measurements. Replaying fewer recorded tracks than available slots repeats tracks. Scripted workloads have a separate source label.
 
@@ -69,7 +87,7 @@ target/release/sendit-probe verify-rules --server target/release/sendit-server
 
 Start one host per port. Competitive balances Terrorists and Counter-Terrorists with up to five players on each side. Relay has two marked sites, outer lanes and a central connector. The round starts when both teams have a player. Buy for 10 seconds, then attack or defend for 105 seconds. The carrier holds E while stationary on a site for 3 seconds to plant. G drops the pack and E recovers it. Defenders have 35 seconds after planting to complete a 5-second defuse, including when the last attacker has died.
 
-Each player has one life per live round. Use Tab for scores and to cycle living teammates while spectating. Both sides start with a 12-round rifle and $1,200. B buys the 30-round kit with 50 armor for $1,200 during buy time. The server awards money for outcomes, kills, and objective work. Survivors can carry their kit forward. Players who join a live round spectate until the next buy phase. Squads swap sides after 12 rounds. First to 13 wins, and 12–12 is a draw. [Relay scoreboard](docs/images/relay.png)
+Each player has one life per live round. Use Tab for scores and to cycle living teammates while spectating. Both sides start with a knife, a pistol, a 12-round M4 and $1,200. B buys the full arsenal, a 30-round M4 and 50 armor for $1,200 during buy time. The server awards money for outcomes, kills, and objective work. Survivors can carry their kit forward. Players who join a live round spectate until the next buy phase. Squads swap sides after 12 rounds. First to 13 wins, and 12–12 is a draw. [Relay scoreboard](docs/images/relay.png)
 
 Deathmatch continually respawns players. Select `--loadout light`, `standard`, or `armored` at startup. On a map without bomb sites, competitive uses elimination and the round clock, so the same geometry can host other rulesets.
 

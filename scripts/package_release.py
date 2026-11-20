@@ -64,7 +64,7 @@ def notices(metadata):
 def support_files(metadata, toolchain_notices):
     for notice in toolchain_notices:
         yield f"notices/toolchain/{notice.parent.name}/{notice.name}", notice
-    for pattern in ("README.md", "scripts/benchmark.py", "maps/*.json", "docs/**/*",
+    for pattern in ("README.md", "scripts/benchmark.py", "scripts/playtest-desktop.py", "maps/*.json", "docs/**/*",
                     "benchmarks/cloud/*.json", "fixtures/relay-desktop.jsonl"):
         for path in sorted(ROOT.glob(pattern)):
             relative = path.relative_to(ROOT)

@@ -13,6 +13,7 @@ on:
       - 'maps/**'
       - 'scripts/package*.py'
       - 'scripts/smoke-macos.py'
+      - 'scripts/playtest-macos.swift'
 
 permissions:
   contents: read
@@ -62,4 +63,11 @@ jobs:
         run: cargo test --release --locked --workspace --target aarch64-apple-darwin
       - name: Playtest the extracted download
         if: ${{ !cancelled() && steps.package.outcome == 'success' }}
-        run: python3 scripts/smoke-macos.py dist/sendit-macos-arm64.zip
+        run: python3 scripts/smoke-macos.py dist/sendit-macos-arm64.zip --output-dir macos-playtest
+      - name: Save the native playtest results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: apple-silicon-playtest
+          path: macos-playtest
+          if-no-files-found: ignore
