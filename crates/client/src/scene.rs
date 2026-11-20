@@ -300,7 +300,9 @@ pub fn sync_players(
         } else {
             Visibility::Inherited
         };
-        let paint = assets.uniform[usize::from(p.team != 0)].clone();
+        // Every other player is a rival in free-for-all, even across the two spawn groups.
+        let blue = s.mode != sendit_sim::Mode::Deathmatch && p.team != 0;
+        let paint = assets.uniform[usize::from(blue)].clone();
         if let Some(entity) = entities.get(&p.id) {
             if let Ok((mut t, mut v, mut m)) = positions.get_mut(*entity) {
                 *t = transform;

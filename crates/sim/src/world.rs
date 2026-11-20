@@ -1,5 +1,6 @@
 //! Authoritative player lifetimes, damage and bounded target rewind.
 use crate::map::Spawn;
+mod deathmatch;
 use crate::motion::{HEIGHT, RADIUS};
 use crate::rules::{credit, Loadout, RoundResult, RuleState, KILL_REWARD, START_MONEY, TEAM_CAP};
 use crate::{
@@ -230,7 +231,12 @@ impl World {
         let Some(current) = self.players.get(&id) else {
             return;
         };
-        let Some(spawn) = self.spawn(current.view.team, current.spawn_slot) else {
+        let spawn = if self.mode == Mode::Deathmatch {
+            self.deathmatch_spawn(current)
+        } else {
+            self.spawn(current.view.team, current.spawn_slot)
+        };
+        let Some(spawn) = spawn else {
             return;
         };
         let loadout = self.spawn_loadout();

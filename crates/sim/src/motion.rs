@@ -225,7 +225,7 @@ fn support(
     result
 }
 
-fn clearance(arena: &Arena, feet: Vec3) -> bool {
+pub(crate) fn clearance(arena: &Arena, feet: Vec3) -> bool {
     let blocked = |bottom: f32, top: f32| top > feet.y + EPS && bottom < feet.y + HEIGHT - EPS;
     !arena
         .boxes
