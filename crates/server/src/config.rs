@@ -33,6 +33,8 @@ Hosting options
 
 Local console commands: status, kick ID, map NAME, next, restart, quit";
 
+pub const MAX_PLAYERS: u16 = 32;
+
 pub struct Config {
     pub bind: SocketAddr,
     pub name: String,
@@ -55,10 +57,9 @@ pub struct Config {
     pub report_ticks: u64,
 }
 
-impl Config {
-    pub fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut args = args;
-        let mut config = Config {
+impl Default for Config {
+    fn default() -> Self {
+        Self {
             bind: "0.0.0.0:27015".parse().unwrap(),
             map: "drill".into(),
             name: "Sendit Community Server".into(),
@@ -78,7 +79,14 @@ impl Config {
             record: None,
             ticks: None,
             report_ticks: 1280,
-        };
+        }
+    }
+}
+
+impl Config {
+    pub fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut args = args;
+        let mut config = Config::default();
         let mut explicit_map = false;
         while let Some(flag) = args.next() {
             let value = args
@@ -144,7 +152,7 @@ impl Config {
                 "--bot-seed" => config.bot_seed = value.parse().map_err(|_| "invalid bot seed")?,
                 "--max-players" => {
                     config.capacity = value.parse().map_err(|_| "invalid player cap")?;
-                    if !(1..=32).contains(&config.capacity) {
+                    if !(1..=MAX_PLAYERS).contains(&config.capacity) {
                         return Err("--max-players must be between 1 and 32".into());
                     }
                 }

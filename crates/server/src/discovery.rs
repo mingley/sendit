@@ -244,7 +244,7 @@ fn directory(bind: SocketAddr) -> io::Result<()> {
     let mut directory = Directory::default();
     let mut gc = Instant::now();
     let mut buffer = [0u8; MAX_PACKET + 1];
-    while !crate::stopping() {
+    while !crate::dedicated::stopping() {
         let now = Instant::now();
         if now >= gc {
             directory.expire(now);
