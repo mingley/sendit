@@ -4,8 +4,9 @@
     cargo build --release --locked --workspace
     python3 scripts/playtest-desktop.py --output-dir /tmp/sendit-playtest
 
-On Debian/Ubuntu install xvfb, x11-utils, libxtst6, libxkbcommon-x11-0, tesseract-ocr-eng,
-mesa-vulkan-drivers, python3-pil and python3-numpy. Xvfb starts automatically.
+On Debian/Ubuntu install xvfb, x11-utils, libxtst6, libxkbcommon-x11-0, tesseract-ocr,
+tesseract-ocr-eng, mesa-vulkan-drivers, python3-pil and python3-numpy.
+Xvfb starts automatically.
 Pass --display :N to use a dedicated GPU-backed X11 display instead.
 """
 import argparse
