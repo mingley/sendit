@@ -246,6 +246,20 @@ impl Session {
         self.players.iter().find(|v| Some(v.id) == self.id)
     }
 
+    fn spawn_pitch(&self) -> f32 {
+        if self.mode != Mode::Surf {
+            return 0.;
+        }
+        self.map
+            .course
+            .get(1)
+            .zip(self.map.course.first())
+            .map_or(0., |(next, start)| {
+                let slope = *next - *start;
+                slope.y.atan2(slope.xz().length()).clamp(-0.8, 0.35)
+            })
+    }
+
     pub fn name(&self, id: u16) -> String {
         self.names
             .get(&id)
@@ -327,7 +341,7 @@ impl Session {
                 self.rifle.tick(
                     combat_input,
                     &self.body,
-                    self.server_tick + index as u32 + 1,
+                    self.server_tick.wrapping_add(index as u32 + 1),
                     sendit_sim::shot_seed(self.id.unwrap_or_default(), cmd.seq),
                     &self.tuning,
                 );
@@ -394,7 +408,7 @@ impl Session {
         if changed_life {
             self.spawn = Some((body, yaw));
             self.input.yaw = yaw;
-            self.input.pitch = 0.;
+            self.input.pitch = self.spawn_pitch();
             self.pending.clear();
             self.accumulator = 0.;
             self.local_shot = None;
@@ -419,8 +433,10 @@ impl Session {
         }
         self.body = body;
         self.rifle = rifle;
-        self.sequence = self.sequence.max(ack);
-        while self.pending.front().is_some_and(|c| c.seq <= ack) {
+        if (self.sequence == 0 && self.pending.is_empty()) || older(self.sequence, ack) {
+            self.sequence = ack;
+        }
+        while self.pending.front().is_some_and(|c| !older(ack, c.seq)) {
             self.pending.pop_front();
         }
         self.replay_pending();
@@ -540,6 +556,11 @@ pub fn receive(
                 s.status = format!("Join rejected | {reason}");
                 eprintln!("{}", s.status);
                 s.rejected = true;
+                s.id = None;
+                s.download = None;
+                s.map_ready = false;
+                s.players.clear();
+                s.pending.clear();
                 if opts.benchmark.is_some() {
                     exit.send(AppExit::error());
                 }
@@ -723,7 +744,7 @@ pub fn sample(
             s.reset_life = Some((life, Instant::now(), Instant::now()));
             s.body = body;
             s.input.yaw = yaw;
-            s.input.pitch = 0.;
+            s.input.pitch = s.spawn_pitch();
             s.rifle = Rifle::default();
             s.pending.clear();
             s.local_shot = None;
@@ -828,8 +849,8 @@ pub fn predict(
             motion::step(&mut s.body, input, &s.map, &s.tuning);
             if s.body.grounded {
                 s.walk_distance += (s.body.pos - before).with_y(0.).length();
-                if s.walk_distance >= 1.85 {
-                    s.walk_distance %= 1.85;
+                if s.walk_distance >= sendit_sim::bots::STEP_STRIDE {
+                    s.walk_distance %= sendit_sim::bots::STEP_STRIDE;
                     audio.emit(Cue::Step, s.body.pos, false);
                 }
             }

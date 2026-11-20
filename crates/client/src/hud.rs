@@ -1,4 +1,5 @@
 //! A compact, high-contrast match HUD. Diagnostic details and the control sheet are opt-in.
+mod course;
 pub mod scoreboard;
 use crate::{game::Session, options::Options};
 use bevy::{prelude::*, window::PrimaryWindow};
@@ -24,6 +25,7 @@ pub enum Field {
     Link,
     Round,
     Health,
+    VitalLabel,
     Ammo,
     Rifle,
     Action,
@@ -120,7 +122,7 @@ pub fn setup(
             BackgroundColor(ink()),
         ))
         .with_children(|row| {
-            row.spawn(text("HP", 15., ash()));
+            row.spawn((text("HP", 15., ash()), Field::VitalLabel));
             row.spawn((text("-", 33., Color::WHITE), Field::Health));
             row.spawn((text("", 14., ash()), Field::Armor));
             row.spawn((text("", 15., amber()), Field::Cash));
@@ -288,10 +290,19 @@ pub fn update(
         Mode::Deathmatch => "DEATHMATCH",
         Mode::Surf => "SURF",
     };
+    let course = if s.mode == Mode::Surf {
+        course::readout(&s.map.course, &s.body, s.input.yaw)
+    } else {
+        Default::default()
+    };
     for (field, mut label) in &mut fields {
         let value = match field {
             Field::Map => {
-                if s.mode == Mode::Competitive {
+                if s.id.is_none() {
+                    "CONNECTING".into()
+                } else if s.map.name.eq_ignore_ascii_case(mode) {
+                    mode.into()
+                } else if s.mode == Mode::Competitive {
                     let side = me.map_or("COMPETITIVE", |p| {
                         if p.team == 0 {
                             "T SIDE"
@@ -308,10 +319,29 @@ pub fn update(
                 .filter(|p| p.armor > 0)
                 .map_or_else(String::new, |p| format!("{} ARMOR", p.armor)),
             Field::Link => format!(
-                "{} PLAYERS   |   {} ms",
+                "{} {}   |   {} ms",
                 s.players.len(),
+                if s.players.len() == 1 {
+                    "PLAYER"
+                } else {
+                    "PLAYERS"
+                },
                 s.rtt_ms.map_or_else(|| "-".into(), |v| format!("{v:.0}"))
             ),
+            Field::VitalLabel => if s.mode == Mode::Surf {
+                "CONTACT"
+            } else {
+                "HP"
+            }
+            .into(),
+            Field::Health if s.mode == Mode::Surf => if s.body.surfing {
+                "BANK"
+            } else if s.body.grounded {
+                "GROUND"
+            } else {
+                "AIR"
+            }
+            .into(),
             Field::Health => me.map_or_else(|| "-".into(), |p| p.hp.to_string()),
             Field::Cash => {
                 if s.mode == Mode::Competitive {
@@ -320,6 +350,7 @@ pub fn update(
                     String::new()
                 }
             }
+            Field::Ammo if s.mode == Mode::Surf => format!("{:.1} m/s", s.body.vel.length()),
             Field::Ammo => {
                 if me.is_some_and(|p| p.armed && p.hp > 0) {
                     if s.mode == Mode::Competitive {
@@ -331,6 +362,7 @@ pub fn update(
                     "-".into()
                 }
             }
+            Field::Rifle if s.mode == Mode::Surf => "SPEED".into(),
             Field::Rifle => if s.rifle.reload_left > 0 {
                 "RELOADING"
             } else if me.is_some_and(|p| !p.armed) {
@@ -339,6 +371,7 @@ pub fn update(
                 "RIFLE"
             }
             .into(),
+            Field::Round if s.mode == Mode::Surf => course.0.clone(),
             Field::Round => {
                 if s.mode == Mode::Competitive {
                     s.round.as_ref().map_or_else(String::new, |r| {
@@ -362,6 +395,8 @@ pub fn update(
                     String::new()
                 }
             }
+            Field::Action if s.scoreboard || s.show_help => String::new(),
+            Field::Action if s.mode == Mode::Surf => course.1.clone(),
             Field::Action => {
                 if s.mode == Mode::Competitive && s.round.is_some_and(|r| r.phase == Phase::Ended) {
                     ended(&s)
@@ -401,7 +436,9 @@ pub fn update(
             Field::Hints => {
                 if s.show_help || s.scoreboard {
                     String::new()
-                } else if matches!(s.mode, Mode::Practice | Mode::Surf) {
+                } else if s.mode == Mode::Surf {
+                    "   F1  Controls     F5  Restart run   ".into()
+                } else if s.mode == Mode::Practice {
                     "   F1  Controls     F3  Telemetry     F5  Reset   ".into()
                 } else {
                     "   Tab  Scoreboard     F1  Controls   ".into()

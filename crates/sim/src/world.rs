@@ -473,7 +473,7 @@ impl World {
 }
 
 /// Nearest intersection with an upright finite cylinder, clipped by opaque map geometry.
-fn body_distance(origin: Vec3, dir: Vec3, feet: Vec3, limit: f32) -> Option<f32> {
+pub(crate) fn body_distance(origin: Vec3, dir: Vec3, feet: Vec3, limit: f32) -> Option<f32> {
     let p = origin - feet;
     let a = dir.x * dir.x + dir.z * dir.z;
     let radial = if a < 1e-9 {

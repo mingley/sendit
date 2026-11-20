@@ -3,7 +3,10 @@ use bevy::{
     audio::{SpatialScale, Volume},
     prelude::*,
 };
-use sendit_sim::{BombView, Phase, RoundResult, TICK_RATE};
+use sendit_sim::{
+    bots::{SHOT_HEARING_RANGE, STEP_HEARING_RANGE, STEP_STRIDE},
+    BombView, Phase, RoundResult, TICK_RATE,
+};
 use std::{
     collections::HashMap,
     f32::consts::TAU,
@@ -56,8 +59,8 @@ impl Cue {
     /// Gain, radius of the inner full-volume region, cutoff radius in world meters.
     fn mix(self) -> (f32, f32, f32) {
         match self {
-            Self::Shot => (0.56, 13.0, 65.0),
-            Self::Step => (0.44, 6.0, 23.0),
+            Self::Shot => (0.56, 13.0, SHOT_HEARING_RANGE),
+            Self::Step => (0.44, 6.0, STEP_HEARING_RANGE),
             Self::Damage => (0.45, 1.0, 1.0),
             Self::Objective => (0.45, 11.0, 45.0),
             Self::Use => (0.4, 4.0, 13.0),
@@ -118,8 +121,8 @@ impl Sound {
         }
         let stride = self.strides.entry(id).or_default();
         *stride += distance;
-        if *stride >= 1.85 {
-            *stride %= 1.85;
+        if *stride >= STEP_STRIDE {
+            *stride %= STEP_STRIDE;
             self.emit(Cue::Step, pos + Vec3::Y * 0.1, true);
         }
     }

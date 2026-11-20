@@ -1,0 +1,26 @@
+{
+  "accuracy_definition": "first post-input fixed tick satisfying the rifle's settled first-shot predicate",
+  "counter_advantage_ms": 289.0625,
+  "counter_advantage_ticks": 37,
+  "counter_strafe": {
+    "accurate_after_ms": 70.3125,
+    "accurate_after_ticks": 9,
+    "speed_on_release_mps": 6.0,
+    "stopped_after_ticks": 9,
+    "stopping_distance_m": 0.1720120906829834
+  },
+  "distance_definition": "maximum forward displacement before motion stops or reverses",
+  "friction_per_s": 5.199999809265137,
+  "map": "drill",
+  "measurement_window_ticks": 192,
+  "release": {
+    "accurate_after_ms": 359.375,
+    "accurate_after_ticks": 46,
+    "speed_on_release_mps": 6.0,
+    "stopped_after_ticks": 52,
+    "stopping_distance_m": 0.9224262237548828
+  },
+  "runup_ticks": 64,
+  "source": "scripted-peek",
+  "tick_hz": 128
+}

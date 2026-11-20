@@ -1,6 +1,7 @@
 mod metrics;
 mod peek;
 mod server;
+mod surf;
 
 use sendit_sim::{replay::Trace, Arena, Mode, Tuning};
 use serde_json::{json, Value};
@@ -9,12 +10,13 @@ use std::{collections::BTreeMap, env, process::ExitCode, str::FromStr};
 const USAGE: &str = "\
 Sendit benchmark and input replay
   sendit-bench peek [--friction N]
+  sendit-bench surf
   sendit-bench record-peek --out FILE
   sendit-bench record-match --out FILE [--map relay] [--players 10] [--ticks 2048]
   sendit-bench replay --file FILE [--friction N]
   sendit-bench server [--players 10] [--ticks 8192] [--warmup 512]
                       [--map drill] [--mode practice] [--friction N]
-                      [--replay FILE]
+                      [--replay FILE] [--bots N] [--bot-skill 0..1] [--bot-seed N]
 
 Input recordings are versioned JSONL at 128 fixed ticks per second. The server
 benchmark advances time without sleeping and prints a JSON report. Use a
@@ -94,6 +96,10 @@ fn run() -> Result<Option<Value>, String> {
     }
     let mut opts = Options::parse(args)?;
     let report = match command.as_str() {
+        "surf" => {
+            opts.finish()?;
+            surf::measure()?
+        }
         "peek" => {
             let tuning = opts.tuning()?;
             opts.finish()?;

@@ -50,7 +50,7 @@ impl Drop for MapDir {
     }
 }
 
-fn cli(server: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn cli(server: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new(server)
         .args(args)
         .output()

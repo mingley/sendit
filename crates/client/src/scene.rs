@@ -33,7 +33,7 @@ fn slot(material: Material) -> usize {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Batch {
     vertices: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
@@ -90,6 +90,8 @@ pub struct ViewModel;
 #[derive(Component)]
 pub struct Remote;
 #[derive(Component)]
+pub struct WornGear(u16);
+#[derive(Component)]
 pub struct Objective;
 #[derive(Resource)]
 pub struct SceneAssets {
@@ -98,6 +100,7 @@ pub struct SceneAssets {
     dark: Handle<StandardMaterial>,
     suit: Handle<Mesh>,
     gear: Handle<Mesh>,
+    unarmed_gear: Handle<Mesh>,
 }
 
 fn material(materials: &mut Assets<StandardMaterial>, rgb: [u8; 3]) -> Handle<StandardMaterial> {
@@ -116,7 +119,17 @@ pub fn setup(
 ) {
     let palette = PALETTE.map(|rgb| material(&mut mats, rgb)).to_vec();
     // Shoulder colors remain readable against the pale concrete and against each other.
-    let uniform = [[183, 84, 44], [41, 102, 150]].map(|rgb| material(&mut mats, rgb));
+    let uniform = [[183, 84, 44], [41, 102, 150]].map(|rgb| {
+        let dye = Color::srgb_u8(rgb[0], rgb[1], rgb[2]);
+        // A small, fixed color contribution keeps team silhouettes readable in unlit corners.
+        mats.add(StandardMaterial {
+            base_color: dye,
+            emissive: dye.to_linear() * 0.36,
+            perceptual_roughness: 0.92,
+            reflectance: 0.12,
+            ..default()
+        })
+    });
     let dark = material(&mut mats, [34, 46, 49]);
     let mut suit = Batch::default();
     let mut gear = Batch::default();
@@ -130,6 +143,7 @@ pub fn setup(
     }
     gear.block([0., 0.79, 0.], [0.42, 0.13, 0.32]);
     gear.block([0., 1.55, -0.161], [0.26, 0.072, 0.025]);
+    let unarmed_gear = meshes.add(gear.clone().mesh());
     gear.block([0.145, 1.16, -0.34], [0.075, 0.125, 0.55]);
     gear.block([0.145, 1.16, -0.66], [0.035, 0.035, 0.16]);
 
@@ -203,6 +217,7 @@ pub fn setup(
         dark,
         suit: meshes.add(suit.mesh()),
         gear: meshes.add(gear.mesh()),
+        unarmed_gear,
     });
 }
 
@@ -251,6 +266,7 @@ pub fn sync_players(
         ),
         With<Remote>,
     >,
+    mut equipment: Query<(&WornGear, &mut Mesh3d)>,
     mut entities: Local<HashMap<u16, Entity>>,
     mut objectives: Query<(&mut Transform, &mut Visibility), (With<Objective>, Without<Remote>)>,
 ) {
@@ -261,6 +277,18 @@ pub fn sync_players(
         }
         keep
     });
+    for (gear, mut mesh) in &mut equipment {
+        let armed =
+            s.mode != sendit_sim::Mode::Surf && s.players.iter().any(|p| p.id == gear.0 && p.armed);
+        let source = if armed {
+            &assets.gear
+        } else {
+            &assets.unarmed_gear
+        };
+        if mesh.0 != *source {
+            mesh.0 = source.clone();
+        }
+    }
     for p in s.players.iter().filter(|v| Some(v.id) != s.id) {
         let (pos, yaw) = s.remote_pose(p);
         let transform = Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(-yaw));
@@ -292,7 +320,12 @@ pub fn sync_players(
                 ))
                 .with_children(|root| {
                     root.spawn((
-                        Mesh3d(assets.gear.clone()),
+                        WornGear(p.id),
+                        Mesh3d(if s.mode != sendit_sim::Mode::Surf && p.armed {
+                            assets.gear.clone()
+                        } else {
+                            assets.unarmed_gear.clone()
+                        }),
                         MeshMaterial3d(assets.dark.clone()),
                     ));
                 })
@@ -351,10 +384,12 @@ pub fn place_camera(
     camera.translation = pos + Vec3::Y * EYE_HEIGHT;
     camera.rotation = Quat::from_euler(EulerRot::YXZ, -yaw, pitch, 0.);
     if let Ok(mut visibility) = guns.get_single_mut() {
-        visibility.set_if_neq(if s.me().is_some_and(|p| p.armed && p.hp > 0) {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        });
+        visibility.set_if_neq(
+            if s.mode != sendit_sim::Mode::Surf && s.me().is_some_and(|p| p.armed && p.hp > 0) {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            },
+        );
     }
 }

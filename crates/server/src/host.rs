@@ -1,5 +1,6 @@
 mod management;
 
+use crate::bots::Bots;
 use crate::config::Config;
 use crate::discovery::{self, Listing, Publisher};
 use crate::stats::Traffic;
@@ -104,6 +105,7 @@ impl Session {
 pub struct Host {
     pub world: World,
     pub config: Config,
+    bots: Bots,
     socket: UdpSocket,
     sessions: BTreeMap<SocketAddr, Session>,
     challenges: BTreeMap<SocketAddr, PendingJoin>,
@@ -128,6 +130,11 @@ impl Host {
         }
         let mut world = World::new(arena, config.mode, config.tuning);
         world.set_dm_loadout(config.dm_loadout);
+        let mut bots = Bots::new(&world.arena, &config);
+        bots.fill(&mut world, 0, &config);
+        if bots.len() < usize::from(config.bots) {
+            return Err("unable to place all fixed bots on this map and team".into());
+        }
         let socket =
             UdpSocket::bind(config.bind).map_err(|e| format!("bind {}: {e}", config.bind))?;
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -147,6 +154,7 @@ impl Host {
             .map_err(|e| format!("open replay: {e}"))?;
         Ok(Self {
             inputs: Vec::with_capacity(usize::from(config.capacity)),
+            bots,
             publisher: Publisher::new(config.directory),
             listing: Listing {
                 name: config.name.clone(),
@@ -178,6 +186,14 @@ impl Host {
         self.sessions.len()
     }
 
+    pub fn bot_count(&self) -> usize {
+        self.bots.len()
+    }
+
+    fn human_slots_full(&self) -> bool {
+        self.sessions.len() >= usize::from(self.config.capacity - self.config.bots)
+    }
+
     fn send_bytes(&mut self, addr: SocketAddr, data: &[u8]) {
         match self.socket.send_to(data, addr) {
             Ok(size) => self.traffic.sent += size as u64,
@@ -205,6 +221,7 @@ impl Host {
             .values()
             .map(|s| (s.id, s.name.clone()))
             .collect();
+        players.extend(self.bots.names());
         players.sort_unstable_by_key(|(id, _)| *id);
         ServerMsg::Roster { players }
     }
@@ -245,7 +262,7 @@ impl Host {
         if self.sessions.contains_key(&addr) {
             return self.repeat_welcome(addr, now);
         }
-        if self.sessions.len() >= usize::from(self.config.capacity) {
+        if self.human_slots_full() {
             return self.send(addr, ServerMsg::Rejected("server full".into()));
         }
         let proof = if let Some(pending) = self.challenges.get(&addr) {
@@ -276,11 +293,18 @@ impl Host {
             return Ok(());
         }
         let pending = self.challenges.remove(&addr).unwrap();
+        if self.human_slots_full() {
+            return self.send(addr, ServerMsg::Rejected("server full".into()));
+        }
         let id = (1..=self.config.capacity).find(|id| self.sessions.values().all(|s| s.id != *id));
         let Some(id) = id else {
             return self.send(addr, ServerMsg::Rejected("server full".into()));
         };
+        let desired = Bots::desired(self.sessions.len() + 1, &self.config);
+        self.bots.make_room(&mut self.world, desired);
         if !self.world.add(id) {
+            self.bots
+                .fill(&mut self.world, self.sessions.len(), &self.config);
             return self.send(addr, ServerMsg::Rejected("no free player slot".into()));
         }
         self.roster_changed = true;
@@ -383,7 +407,7 @@ impl Host {
                 continue;
             }
             if discovery::matches(&buffer[..len]) {
-                self.listing.players = self.sessions.len() as u16;
+                self.listing.players = (self.sessions.len() + self.bots.len()) as u16;
                 self.publisher
                     .receive(&self.socket, addr, &buffer[..len], &self.listing);
                 continue;
@@ -458,6 +482,10 @@ impl Host {
             }
             true
         });
+        if self.roster_changed {
+            self.bots
+                .fill(&mut self.world, self.sessions.len(), &self.config);
+        }
         self.inputs.sort_unstable_by_key(|(id, _)| *id);
         if let Some(trace) = &mut self.trace {
             for (id, command) in &self.inputs {
@@ -466,9 +494,10 @@ impl Host {
                 }
             }
         }
+        self.bots.commands(&self.world, &mut self.inputs);
         self.world.advance(&self.inputs);
         if self.config.directory.is_some() && self.world.tick % sendit_sim::TICK_RATE == 1 {
-            self.listing.players = self.sessions.len() as u16;
+            self.listing.players = (self.sessions.len() + self.bots.len()) as u16;
             self.publisher.heartbeat(&self.socket, now, &self.listing);
         }
         if !self.sessions.is_empty() {
@@ -488,9 +517,9 @@ impl Host {
             }
             if self.roster_changed || self.world.tick % sendit_sim::TICK_RATE == 0 {
                 self.broadcast(self.roster())?;
-                self.roster_changed = false;
             }
         }
+        self.roster_changed = false;
         Ok(())
     }
 
@@ -634,5 +663,55 @@ mod tests {
         request(&mut host, &bob, ClientMsg::Confirm { token });
         assert!(matches!(receive(&bob), ServerMsg::Welcome { .. }));
         assert_eq!(host.connected(), 1);
+    }
+
+    #[test]
+    fn confirmed_humans_displace_fill_and_releases_restore_it() {
+        let args = [
+            "--bind",
+            "127.0.0.1:0",
+            "--max-players",
+            "3",
+            "--bots",
+            "1",
+            "--fill",
+            "3",
+        ];
+        let mut host =
+            Host::bind(Config::parse(args.into_iter().map(str::to_owned)).unwrap()).unwrap();
+        assert_eq!(host.bot_count(), 3);
+        let client = socket();
+        request(&mut host, &client, join(""));
+        let ServerMsg::Challenge { token } = receive(&client) else {
+            panic!("missing challenge")
+        };
+        assert_eq!(host.bot_count(), 3);
+        request(&mut host, &client, ClientMsg::Confirm { token });
+        assert_eq!(host.connected(), 1);
+        assert_eq!(host.bot_count(), 2);
+        assert_eq!(host.world.views().len(), 3);
+
+        // Rotation retains the real participant, bot identities and assigned teams.
+        let members = |h: &Host| {
+            h.world
+                .views()
+                .into_iter()
+                .map(|v| (v.id, v.team))
+                .collect::<Vec<_>>()
+        };
+        let before = members(&host);
+        host.command("map relay", Instant::now()).unwrap();
+        assert_eq!(members(&host), before);
+        let source = client.local_addr().unwrap();
+        let new_ticket = host.sessions[&source].token;
+        assert_ne!(new_ticket, token);
+        request(&mut host, &client, ClientMsg::Leave { token: new_ticket });
+        assert_eq!(host.connected(), 0);
+        assert_eq!(host.bot_count(), 3);
+        assert!(host
+            .world
+            .views()
+            .iter()
+            .all(|v| v.id >= sendit_sim::wire::FIRST_BOT_ID));
     }
 }

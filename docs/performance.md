@@ -36,3 +36,17 @@ python3 scripts/benchmark.py server --map relay --mode competitive --players 10 
 The original cloud rehearsal used the same ten scripted tracks in the fast-forward and live UDP runners. The live server's 1,024-tick window contained 263 buy ticks and 761 live ticks. Median/p95/p99 tick work was 30/92/133 µs, with one scheduler miss, 0.725% of one core, 1,724 KiB RSS and 10.177/33.367 KiB/s per client up/down. The in-process run measured 7.13/10.34/21.22 µs and excludes the UDP socket and pacing loop. [Live measurements](../benchmarks/cloud/relay-replay-udp.json) · [Fixed-loop measurements](../benchmarks/cloud/relay-replay-fixed.json)
 
 The drill's two-client regression runs with 36 ms of simulated one-way latency, up to 10 ms of jitter in each direction, and 6% packet loss. It checks prediction against acknowledged positions, a blocked shot, a moving-target hit, health, kill credit and respawn. The default tuning replay restores settled accuracy in 46 ticks on release and 9 ticks under counter-strafe. Maximum travel in the original direction is 0.922 m and 0.172 m respectively. Friction 8.0 changes those distances to 0.574 m and 0.145 m.
+
+## Desktop input fixture and bot workloads
+
+The small `fixtures/relay-desktop.jsonl` recording came through the native mouse and keyboard input path on Relay. X11 automation generated the movements and clicks. The fixture contains 932 fixed ticks and 20 distinct yaw values. Its source field identifies the automation. A genuine human session can use the same commands and trace format.
+
+```sh
+target/release/sendit-bench replay --file fixtures/relay-desktop.jsonl
+python3 scripts/benchmark.py server --map relay --mode competitive --players 10 --seconds 12 --warmup-seconds 12 --replay fixtures/relay-desktop.jsonl --output results/replay-server.json
+python3 scripts/benchmark.py server --map relay --mode competitive --players 10 --seconds 12 --warmup-seconds 12 --bots 10 --output results/bot-server.json
+python3 scripts/benchmark.py server --map relay --mode competitive --players 10 --seconds 12 --warmup-seconds 12 --bots 9 --output results/mixed-server.json
+target/release/sendit-bench server --map relay --mode competitive --players 10 --bots 10 --warmup 1536 --ticks 32768
+```
+
+The live bot-only case includes AI perception, route choice, inputs and the authoritative match. A bot executes inside the server process and sends no UDP traffic. The mixed run adds one actual network peer to measure the traffic a connected player receives with nine bots. The fixed-loop report also times the bot controller itself inside the measured tick.

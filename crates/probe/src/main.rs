@@ -1,3 +1,4 @@
+mod bots;
 mod hosting;
 mod net;
 mod rules;
@@ -18,18 +19,21 @@ const HELP: &str = "Sendit UDP probe
   sendit-probe verify [--server PATH]
   sendit-probe verify-rules [--server PATH]
   sendit-probe verify-hosting [--server PATH]
+  sendit-probe verify-bots [--server PATH] [--case fill|skill|duel|plant|defuse]
   sendit-probe smoke [--connect HOST:PORT] [--latency-ms N] [--jitter-ms N] [--loss-pct N] [--seed N]
   sendit-probe load [--connect HOST:PORT] [--players N] [--seconds N] [--replay FILE]
 
 verify launches two fresh drill servers, testing both LAN conditions and a seeded impaired link.
 verify-rules tests competitive bomb play and deathmatch loadouts on separate local servers.
 verify-hosting starts a local directory and community hosts to check operator and player workflows.
+verify-bots exercises fill, skill and bomb objectives over UDP.
 smoke expects an empty practice server on the drill map. Latency and jitter apply in each direction.
 load occupies a live server. Without an input trace it uses a synthetic movement and firing pattern.
 Use --password-env NAME to join a protected smoke or load server.";
 
 struct Options {
     action: String,
+    case: Option<String>,
     addr: String,
     server: PathBuf,
     net: Impairment,
@@ -48,6 +52,7 @@ impl Options {
             .with_file_name(format!("sendit-server{}", env::consts::EXE_SUFFIX));
         let mut o = Self {
             action,
+            case: None,
             addr: "127.0.0.1:27015".into(),
             server: sibling,
             net: Impairment::default(),
@@ -63,6 +68,7 @@ impl Options {
             match key.as_str() {
                 "--connect" => o.addr = value,
                 "--server" => o.server = value.into(),
+                "--case" => o.case = Some(value),
                 "--latency-ms" => {
                     o.net.latency_ms = value.parse().map_err(|_| "invalid latency")?
                 }
@@ -188,6 +194,7 @@ fn run() -> Result<(), String> {
         }
         "verify-rules" => rules::verify(&o.server),
         "verify-hosting" => hosting::verify(&o.server),
+        "verify-bots" => bots::verify(&o.server, o.case.as_deref()),
         "smoke" => scenario::smoke(&o.addr, &o.password, o.net),
         "load" => scenario::load(
             &o.addr,

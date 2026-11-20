@@ -369,9 +369,10 @@ pub fn step(body: &mut Body, input: Input, arena: &Arena, tuning: &Tuning) {
     let mut planar = Vec2::new(body.vel.x, body.vel.z);
     if body.grounded && !jump {
         let speed = planar.length();
+        let drag = speed.max(tuning.stop_speed) * tuning.friction.max(0.0) * DT;
+        let after_drag = (speed - drag).max(0.0);
         if speed > 0.0 {
-            let drag = speed.max(tuning.stop_speed) * tuning.friction.max(0.0) * DT;
-            planar *= (speed - drag).max(0.0) / speed;
+            planar *= after_drag / speed;
         }
         let accel = if wish.dot(planar) < -EPS {
             tuning.counter_accel
@@ -379,7 +380,9 @@ pub fn step(body: &mut Body, input: Input, arena: &Arena, tuning: &Tuning) {
             tuning.ground_accel
         };
         accelerate(&mut planar, wish, tuning.run_speed, accel);
-        planar = planar.clamp_length_max(tuning.run_speed.max(0.0));
+        // Ground input cannot manufacture overspeed, but a landing retains its
+        // incoming horizontal momentum and loses it to ordinary friction.
+        planar = planar.clamp_length_max(tuning.run_speed.max(after_drag));
     } else {
         accelerate(&mut planar, wish, tuning.air_wish_cap, tuning.air_accel);
         if let Some(f) = floor.filter(|_| body.surfing) {

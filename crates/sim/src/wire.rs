@@ -4,7 +4,9 @@ use crate::{Input, Mode, PlayerView, RoundView, Tuning};
 use bincode::Options;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub const PROTOCOL: u16 = 3;
+pub const PROTOCOL: u16 = 4;
+/// UDP player IDs are below this stable server-assigned bot range.
+pub const FIRST_BOT_ID: u16 = 1001;
 /// Custom maps travel as individually requested sub-MTU datagrams.
 pub const CHUNK_BYTES: usize = 900;
 pub const MAX_PACKET: usize = 60_000;

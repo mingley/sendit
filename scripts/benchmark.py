@@ -77,6 +77,11 @@ def main():
     parser.add_argument("--map", default="drill")
     parser.add_argument("--mode", default="practice", choices=["practice", "deathmatch", "competitive", "surf"])
     parser.add_argument("--players", type=int, default=10)
+    parser.add_argument("--bots", type=int, default=0, help="occupied slots controlled by server AI")
+    parser.add_argument("--bot-skill", type=float, default=0.65)
+    parser.add_argument("--bot-seed", type=int, default=6619)
+    parser.add_argument("--warmup-seconds", type=int, default=0,
+                        help="minimum server age at the start of a sampled server window")
     parser.add_argument("--seconds", type=int, default=10, help="length of the measured window")
     parser.add_argument("--replay", type=Path, help="drive remote players from a recorded input trace")
     parser.add_argument("--output", type=Path, default=Path("results/match.json"))
@@ -85,13 +90,20 @@ def main():
     args = parser.parse_args()
     if not 2 <= args.players <= 32 or not 2 <= args.seconds <= 3600:
         parser.error("--players must be 2..32 and --seconds must be 2..3600")
+    max_bots = args.players - int(args.target == "client")
+    if not 0 <= args.bots <= max_bots or not 0 <= args.bot_skill <= 1 or args.warmup_seconds < 0:
+        parser.error("bots must fit the available slots, skill must be 0..1, and warmup nonnegative")
+    if args.bots == args.players and args.replay:
+        parser.error("input replay requires at least one network client")
     bins = args.bin_dir.resolve()
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     interval = args.seconds * 128
     server = [bins / "sendit-server", "--bind", "127.0.0.1:0", "--map", args.map,
               "--mode", args.mode, "--max-players", args.players, "--report-ticks", interval]
-    source = "scripted UDP input"
+    if args.bots:
+        server.extend(["--bots", args.bots, "--bot-skill", args.bot_skill, "--bot-seed", args.bot_seed])
+    source = "scripted UDP input" if max_bots - args.bots else "server bots"
     track_count = None
     if args.replay:
         args.replay = args.replay.resolve()
@@ -107,13 +119,15 @@ def main():
         lines = messages(host)
         ready = wait_for(lines, lambda line: line.startswith("SENDIT_READY "), 10, [host])
         addr = re.search(r"addr=(\S+)", ready).group(1)
-        count = args.players - int(args.target == "client")
-        # Keep peers joined during graphical adapter startup and shader warmup.
-        joiners = [bins / "sendit-probe", "load", "--connect", addr, "--players", count,
-                   "--seconds", 3 * args.seconds + 120]
-        if args.replay:
-            joiners.extend(["--replay", args.replay])
-        peers = stack.enter_context(child(joiners, stdout=sys.stderr))
+        count = max_bots - args.bots
+        processes = [host]
+        if count:
+            # Keep peers joined through graphical adapter startup and shader warmup.
+            joiners = [bins / "sendit-probe", "load", "--connect", addr, "--players", count,
+                       "--seconds", args.warmup_seconds + 3 * args.seconds + 120]
+            if args.replay:
+                joiners.extend(["--replay", args.replay])
+            processes.append(stack.enter_context(child(joiners, stdout=sys.stderr)))
         if args.target == "client":
             client = [bins / "sendit-client", "--connect", addr, "--name", "benchmark",
                       "--width", args.width, "--height", args.height, "--benchmark", args.seconds,
@@ -124,19 +138,27 @@ def main():
             measured = json.loads(output.read_text())
             measured["peer_workload"] = source
             measured["recorded_input_tracks"] = track_count
+            measured["bots"] = args.bots
+            measured["bot_skill"] = args.bot_skill if args.bots else None
+            measured["bot_seed"] = args.bot_seed if args.bots else None
             output.write_text(json.dumps(measured, indent=2) + "\n")
             return
 
         def fully_occupied(line):
             fields = dict(re.findall(r"(\w+)=([^ ]+)", line))
             return (line.startswith("stats ") and fields.get("players_min") == str(args.players)
-                    and fields.get("ticks") == str(interval))
+                    and fields.get("humans") == str(count)
+                    and fields.get("ticks") == str(interval)
+                    and int(fields["tick"]) - interval >= args.warmup_seconds * 128)
 
-        line = wait_for(lines, fully_occupied, 3 * args.seconds + 15, [host, peers])
+        line = wait_for(lines, fully_occupied, args.warmup_seconds + 3 * args.seconds + 15, processes)
         fields = dict(re.findall(r"(\w+)=([^ ]+)", line))
         stats = {key: float(value) if "." in value else int(value) if value.isdigit() else value
                  for key, value in fields.items()}
         report = dict(workload=source, map=args.map, rules=args.mode, players=args.players,
+                      bots=args.bots, bot_skill=args.bot_skill if args.bots else None,
+                      bot_seed=args.bot_seed if args.bots else None,
+                      network_clients=count, warmup_seconds_min=args.warmup_seconds,
                       resolution=None, binary_directory_label=bins.name,
                       profile="release" if bins == (ROOT / "target/release").resolve() else "provided binary",
                       cpu=cpu_name(), platform=platform.platform(), recorded_input_tracks=track_count,

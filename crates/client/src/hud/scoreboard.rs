@@ -136,7 +136,20 @@ pub fn update(
                     for p in players {
                         let marker = if Some(p.id) == s.id { '>' } else { ' ' };
                         let state = if p.hp == 0 { 'x' } else { ' ' };
-                        let name: String = s.name(p.id).chars().take(18).collect();
+                        let name = s.name(p.id);
+                        let name: String = if p.id >= sendit_sim::wire::FIRST_BOT_ID {
+                            format!(
+                                "[BOT] {}",
+                                name.strip_prefix("BOT ")
+                                    .or_else(|| name.strip_prefix("Bot "))
+                                    .unwrap_or(&name)
+                            )
+                        } else {
+                            name
+                        }
+                        .chars()
+                        .take(18)
+                        .collect();
                         rows.push(format!(
                             "{marker}{state}  {name:<18} {:>3} {:>3}",
                             p.kills, p.deaths

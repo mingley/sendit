@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 const HELP: &str =
     "sendit-client [--connect HOST:PORT] [--name NAME] [--password-env NAME | --password PASSWORD]
-  --sensitivity NUMBER       Radians per raw mouse count (default 0.002)
+  --sensitivity NUMBER       Radians per raw mouse count (default 0.001)
   --width PX --height PX     Window dimensions (default 1920 x 1080)
   --record FILE              Record live fixed-tick inputs
   --replay FILE              Play the first player's input track
@@ -38,7 +38,7 @@ impl Default for Options {
             address: "127.0.0.1:27015".into(),
             name: "Player".into(),
             password: String::new(),
-            sensitivity: 0.002,
+            sensitivity: 0.001,
             width: 1920,
             height: 1080,
             record: None,

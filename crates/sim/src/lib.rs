@@ -1,5 +1,6 @@
 //! Sendit's shared deterministic gameplay. Positions are feet coordinates in meters.
 //! One simulation step always advances 1/128 s, regardless of render or packet cadence.
+pub mod bots;
 pub mod map;
 pub mod motion;
 pub mod replay;

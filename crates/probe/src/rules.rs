@@ -5,12 +5,27 @@ use crate::{
     scenario::{aim, connect, pace},
     start_server,
 };
-use sendit_sim::{BombView, Input, Phase, PlayerView, Vec3};
+use sendit_sim::{Body, BombView, Input, Phase, PlayerView, Vec3};
 use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 type Inputs = Vec<(u16, Input)>;
+
+pub(crate) fn steer(body: Body, goal: Vec3) -> Input {
+    let delta = (goal - body.pos).with_y(0.);
+    // Slow down early and counteract measured velocity on approach.
+    let wish = ((delta * 3.5 - body.vel.with_y(0.) * 0.35) / 5.).clamp_length_max(1.);
+    Input {
+        strafe: wish.x,
+        forward: -wish.z,
+        ..Input::default()
+    }
+}
+
+pub(crate) fn arrived(body: Body, goal: Vec3) -> bool {
+    (body.pos - goal).with_y(0.).length() < 0.18 && body.vel.length() < 0.35
+}
 
 struct Squad {
     peers: Vec<Peer>,
@@ -107,27 +122,12 @@ impl Squad {
             |s, _| {
                 goals
                     .iter()
-                    .map(|&(id, goal)| {
-                        let body = s.player(id)?.body;
-                        let delta = (goal - body.pos).with_y(0.);
-                        // Slow down early and counteract measured velocity on approach.
-                        let steer =
-                            ((delta * 3.5 - body.vel.with_y(0.) * 0.35) / 5.).clamp_length_max(1.);
-                        let input = Input {
-                            strafe: steer.x,
-                            forward: -steer.z,
-                            ..Input::default()
-                        };
-                        Ok((id, input))
-                    })
+                    .map(|&(id, goal)| Ok((id, steer(s.player(id)?.body, goal))))
                     .collect()
             },
             |s| {
                 goals.iter().try_fold(true, |ready, &(id, goal)| {
-                    let body = s.player(id)?.body;
-                    Ok(ready
-                        && (body.pos - goal).with_y(0.).length() < 0.18
-                        && body.vel.length() < 0.35)
+                    Ok(ready && arrived(s.player(id)?.body, goal))
                 })
             },
         )

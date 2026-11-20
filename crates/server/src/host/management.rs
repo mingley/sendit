@@ -21,6 +21,9 @@ impl Host {
             }
             tickets.push((addr, new_token().map_err(|e| e.to_string())?));
         }
+        let bots = self
+            .bots
+            .for_rotation(&self.world, &mut world, &self.config)?;
         self.flush().map_err(|e| e.to_string())?;
         let next_trace = if let Some(path) = self.config.record.as_ref() {
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
@@ -42,6 +45,7 @@ impl Host {
         self.trace_serial += 1;
         self.trace = next_trace;
         self.world = world;
+        self.bots = bots;
         self.custom_source = source;
         self.config.map = name.into();
         self.listing.map = name.into();
@@ -105,14 +109,19 @@ impl Host {
             ["help"] => println!("status | kick ID | map NAME | next | restart | quit"),
             ["status"] => {
                 println!(
-                    "status map={} mode={:?} players={} cap={}",
+                    "status map={} mode={:?} players={} cap={} humans={} bots={}",
                     self.config.map,
                     self.config.mode,
+                    self.connected() + self.bots.len(),
+                    self.config.capacity,
                     self.connected(),
-                    self.config.capacity
+                    self.bots.len()
                 );
                 for session in self.sessions.values() {
                     println!("player id={} name={:?}", session.id, session.name);
+                }
+                for (id, name) in self.bots.names() {
+                    println!("bot id={id} name={name:?}");
                 }
             }
             ["next"] => self.next_map(now)?,

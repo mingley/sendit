@@ -1,7 +1,11 @@
 //! Shared collision, rendering, and navigation geometry. Coordinates are meters, Y up.
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 pub const MAX_MAP_BYTES: usize = 48 * 1024;
 const WORLD_LIMIT: f32 = 2048.0;
@@ -88,6 +92,9 @@ pub struct Arena {
     /// Traversable landmarks in world space, at foot height.
     #[serde(default)]
     pub nav: Vec<Vec3>,
+    /// Ordered course markers at foot height. The first and last mark the start and finish.
+    #[serde(default)]
+    pub course: Vec<Vec3>,
 }
 
 /// Identifiers are also used in the network protocol. A map name is a single filename stem.
@@ -111,6 +118,8 @@ fn embedded(name: &str) -> Option<&'static [u8]> {
     match name {
         "drill" => Some(include_bytes!("../../../maps/drill.json")),
         "relay" => Some(include_bytes!("../../../maps/relay.json")),
+        "aim" => Some(include_bytes!("../../../maps/aim.json")),
+        "surf" => Some(include_bytes!("../../../maps/surf.json")),
         _ => None,
     }
 }
@@ -128,15 +137,19 @@ impl Arena {
 
     /// Preserve the validated source of installed maps for clients joining this host.
     pub fn load_with_source(name: &str) -> Result<(Self, Option<Vec<u8>>), String> {
+        let dir = std::env::var_os("SENDIT_MAP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("maps"));
+        Self::load_in(name, &dir)
+    }
+
+    fn load_in(name: &str, dir: &Path) -> Result<(Self, Option<Vec<u8>>), String> {
         if !valid_map_name(name) {
             return Err("invalid map name (use letters, digits, dash, or underscore)".into());
         }
         let (arena, source) = if let Some(bytes) = embedded(name) {
             (Self::from_json(bytes)?, None)
         } else {
-            let dir = std::env::var_os("SENDIT_MAP_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("maps"));
             let path = dir.join(format!("{name}.json"));
             let mut bytes = Vec::new();
             File::open(&path)
@@ -169,8 +182,10 @@ impl Arena {
             || self.spawns.len() > 64
             || self.sites.len() > 8
             || self.nav.len() > 256
+            || self.course.len() == 1
+            || self.course.len() > 64
         {
-            return Err("map requires 1–512 solids and 1–64 spawns, up to 8 sites and 256 navigation points".into());
+            return Err("map requires 1–512 solids and 1–64 spawns, up to 8 sites, 256 navigation points and an optional 2–64 point course".into());
         }
         for (index, b) in self.boxes.iter().enumerate() {
             if !valid_bounds(b.min, b.max) {
@@ -194,6 +209,14 @@ impl Arena {
         }
         if self.nav.iter().any(|p| !in_world(*p)) {
             return Err("navigation point outside world bounds".into());
+        }
+        if self.course.iter().any(|p| !in_world(*p))
+            || self
+                .course
+                .windows(2)
+                .any(|pair| pair[0].distance_squared(pair[1]) < 0.01)
+        {
+            return Err("course markers must be in bounds and separated by at least 0.1 m".into());
         }
         Ok(())
     }
@@ -318,6 +341,65 @@ mod tests {
         let mut drill = Arena::load("drill").unwrap();
         drill.boxes[0].max = drill.boxes[0].min;
         assert!(drill.validate().is_err());
+    }
+
+    #[test]
+    fn installed_map_preserves_exact_source_and_checks_the_declared_identifier() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "sendit-map-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let original =
+            include_str!("../../../maps/aim.json").replacen("\"aim\"", "\"wide_lane\"", 1);
+        let path = dir.join("wide_lane.json");
+        fs::write(&path, &original).unwrap();
+        let (arena, bytes) = Arena::load_in("wide_lane", &dir).unwrap();
+        assert!(!is_builtin("wide_lane"));
+        assert_eq!(arena.name, "wide_lane");
+        assert_eq!(bytes.unwrap(), original.as_bytes());
+        let wrong = dir.join("other_name.json");
+        fs::rename(&path, &wrong).unwrap();
+        assert!(Arena::load_in("other_name", &dir).is_err());
+        fs::remove_file(wrong).unwrap();
+        fs::remove_dir(dir).unwrap();
+        for name in ["drill", "relay", "aim", "surf"] {
+            assert!(is_builtin(name));
+            assert!(Arena::load_with_source(name).unwrap().1.is_none());
+        }
+    }
+
+    #[test]
+    fn tactical_navigation_points_and_team_starts_are_clear_and_supported() {
+        use crate::motion::{HEIGHT, RADIUS};
+        for name in ["drill", "aim", "relay"] {
+            let arena = Arena::load(name).unwrap();
+            for &foot in arena.nav.iter().chain(arena.spawns.iter().map(|s| &s.pos)) {
+                for solid in &arena.boxes {
+                    let xz = foot.x > solid.min.x - RADIUS
+                        && foot.x < solid.max.x + RADIUS
+                        && foot.z > solid.min.z - RADIUS
+                        && foot.z < solid.max.z + RADIUS;
+                    assert!(
+                        !(xz && solid.min.y < foot.y + HEIGHT && solid.max.y > foot.y),
+                        "{name} waypoint {foot:?} intersects {solid:?}"
+                    );
+                }
+                let from = foot + Vec3::Y * 0.1;
+                assert!(
+                    (arena.ray_distance(from, -Vec3::Y, 1.0) - 0.1).abs() < 0.001,
+                    "{name} waypoint {foot:?} lacks floor"
+                );
+            }
+        }
     }
 
     #[test]

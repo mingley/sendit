@@ -1,5 +1,6 @@
 use crate::{metrics, mode, Options};
 use sendit_sim::{
+    bots::{BotBrain, BotNav, DEFAULT_BOT_SEED},
     replay::{Trace, TraceWriter},
     wire::{decode, encode, ClientMsg, Command, ServerMsg, INPUT_REDUNDANCY},
     Arena, Input, Mode, Phase, Tuning, World,
@@ -57,15 +58,6 @@ pub fn record_match(mut opts: Options) -> Result<Value, String> {
     }
     writer.flush().map_err(|e| e.to_string())?;
     Ok(json!({"source":"scripted-match-v1","saved":path,"ticks":ticks,"tracks":count,"map":map}))
-}
-
-fn occupy(world: &mut World, count: usize) -> Result<(), String> {
-    for id in 1..=count as u16 {
-        if !world.add(id) {
-            return Err(format!("world rejected slot {id}"));
-        }
-    }
-    Ok(())
 }
 
 pub fn replay_run(arena: Arena, tuning: Tuning, trace: &Trace) -> Result<Value, String> {
@@ -148,15 +140,37 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
     let count = opts.value("--players", 10usize)?;
     let ticks = opts.value("--ticks", 8192u32)?;
     let warmup = opts.value("--warmup", 512u32)?;
+    let bots = opts.value("--bots", 0usize)?;
+    let skill = opts.value("--bot-skill", 0.65f32)?;
+    let seed = opts.value("--bot-seed", DEFAULT_BOT_SEED)?;
     opts.finish()?;
     if !(1..=32).contains(&count) || !(1..=MAX_TICKS).contains(&ticks) || warmup > MAX_TICKS {
         return Err("players must be 1..32, ticks 1..10000000, warmup 0..10000000".into());
     }
+    if bots > count || !(0.0..=1.0).contains(&skill) {
+        return Err("--bots must fit the player count and --bot-skill must be in [0, 1]".into());
+    }
+    let clients = count - bots;
+    if clients == 0 && trace.is_some() {
+        return Err("at least one network slot is required to replay client input".into());
+    }
 
     let arena = Arena::load(&map)?;
     let mut world = World::new(arena, mode, tuning);
-    occupy(&mut world, count)?;
-    let mut windows = vec![VecDeque::with_capacity(INPUT_REDUNDANCY); count];
+    let first_bot = sendit_sim::wire::FIRST_BOT_ID;
+    let bot_ids = first_bot..first_bot + bots as u16;
+    let player_ids: Vec<_> = bot_ids.clone().chain(1..=clients as u16).collect();
+    for &id in &player_ids {
+        if !world.add(id) {
+            return Err(format!("world rejected slot {id}"));
+        }
+    }
+    let nav = (bots > 0).then(|| BotNav::new(&world.arena));
+    let mut brains: Vec<_> = bot_ids
+        .map(|id| (id, BotBrain::new(id, skill, seed)))
+        .collect();
+    let mut ai_samples = Vec::new();
+    let mut windows = vec![VecDeque::with_capacity(INPUT_REDUNDANCY); clients];
     let mut packets = Vec::with_capacity(count);
     let mut inputs = Vec::with_capacity(count);
     let mut samples = Vec::with_capacity(ticks as usize);
@@ -206,8 +220,36 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
             let command = *commands.last().ok_or("empty redundant command window")?;
             inputs.push((slot as u16 + 1, command));
         }
+        if let Some(nav) = &nav {
+            let start_ai = Instant::now();
+            let views = world.views();
+            let round = world.round_view();
+            for (id, brain) in &mut brains {
+                let me = world.view(*id).expect("occupied bot slot");
+                let input = brain.command(
+                    world.tick.wrapping_add(1),
+                    mode,
+                    me,
+                    &views,
+                    &round,
+                    &world.arena,
+                    nav,
+                );
+                inputs.push((
+                    *id,
+                    Command {
+                        seq: tick + 1,
+                        seen_tick: world.tick,
+                        input,
+                    },
+                ));
+            }
+            if measuring {
+                ai_samples.push(start_ai.elapsed().as_nanos() as u64);
+            }
+        }
         world.advance(&inputs);
-        if world.tick % SNAPSHOT_INTERVAL == 0 {
+        if clients > 0 && world.tick % SNAPSHOT_INTERVAL == 0 {
             latest_snapshot = world.tick;
             let snapshot = ServerMsg::Snapshot {
                 tick: world.tick,
@@ -220,7 +262,7 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
                 window.clear();
             }
             if measuring {
-                traffic.down += bytes as u64 * count as u64;
+                traffic.down += bytes as u64 * clients as u64;
                 snapshots += 1;
             }
         }
@@ -234,7 +276,9 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
                 Phase::Ended => 4,
             };
             phase_ticks[phase] += 1;
-            shots += (1..=count as u16)
+            shots += player_ids
+                .iter()
+                .copied()
                 .filter(|&id| {
                     world
                         .view(id)
@@ -252,12 +296,29 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
     let busy: u64 = samples.iter().sum();
     samples.sort_unstable();
     let to_ms = |n: u64| n as f64 / 1e6;
-    let scenario = trace.as_ref().map_or_else(||json!({"source":"deterministic-script","seed":"slot and fixed tick"}),|t|
+    let client_source = if clients == 0 {
+        "no network clients"
+    } else {
+        "deterministic-script"
+    };
+    let scenario = trace.as_ref().map_or_else(||json!({"source":client_source,"seed":"slot and fixed tick"}),|t|
         json!({"source":t.header.source,"trace_tracks":t.track_count(),"trace_ticks":t.duration(),
         "fan_out":"slot modulo track count, repeated tracks offset by 97 ticks; loops at trace end"}));
+    ai_samples.sort_unstable();
+    let ai_ms = (!ai_samples.is_empty()).then(|| {
+        json!({
+            "p50":to_ms(metrics::percentile(&ai_samples,50)),
+            "p95":to_ms(metrics::percentile(&ai_samples,95)),
+            "p99":to_ms(metrics::percentile(&ai_samples,99)),
+            "max":to_ms(*ai_samples.last().unwrap())
+        })
+    });
+    let client_rate =
+        |bytes: u64| (clients > 0).then(|| bytes as f64 / clients as f64 / simulated_seconds);
     Ok(json!({
         "benchmark":"authoritative-fixed-loop", "platform":metrics::platform(),
         "map":map,"mode":mode_name,"players":count,"workload":scenario,
+        "bots":bots,"network_clients":clients,"bot_skill":skill,"bot_seed":seed,"bot_decision_work_ms":ai_ms,
         "tick_hz":TICK_HZ,"snapshot_hz":TICK_HZ/SNAPSHOT_INTERVAL,"warmup_ticks":warmup,
         "measured_ticks":ticks,"snapshots_serialized":snapshots,"simulated_seconds":simulated_seconds,
         "phase_ticks":{"warmup":phase_ticks[0],"buy":phase_ticks[1],"live":phase_ticks[2],"planted":phase_ticks[3],"ended":phase_ticks[4]},
@@ -265,15 +326,14 @@ pub fn run(mut opts: Options) -> Result<Value, String> {
         "deadline_ms":to_ms(DEADLINE_NS),"work_over_deadline_ticks":missed,
         "tick_ms":{"p50":to_ms(metrics::percentile(&samples,50)),"p95":to_ms(metrics::percentile(&samples,95)),
             "p99":to_ms(metrics::percentile(&samples,99)),"max":to_ms(*samples.last().unwrap())},
-        "tick_scope":"decode received input, authoritative world tick and serialize shared snapshot; no socket or scheduler wait",
+        "tick_scope":"decode received input, run bot control and the authoritative world tick, then serialize any network snapshot; excludes socket and scheduler waits",
         "process_cpu_seconds_including_driver":cpu, "wall_seconds_fast_forward":wall,
         "process_cpu_pct_of_one_core_including_driver":cpu.map(|s|s/wall*100.0),
         "tick_work_pct_of_realtime_budget":(busy as f64 / 1e9)/simulated_seconds*100.0,
         "rss_kib":metrics::resident_kib("VmRSS"),"peak_rss_kib":metrics::resident_kib("VmHWM"),
         "payload_bytes_per_player_per_second":{
-            "uplink":traffic.up as f64/count as f64/simulated_seconds,
-            "downlink":traffic.down as f64/count as f64/simulated_seconds,
-            "scope":"serialized UDP payload only; latest unacknowledged commands (up to 6), immediate LAN acknowledgments at 32 Hz; no join/loss/IP headers"
+            "uplink":client_rate(traffic.up),"downlink":client_rate(traffic.down),
+            "scope":"payload per simulated network client; up to 6 unacknowledged commands, immediate LAN acknowledgments at 32 Hz; excludes join/loss/IP headers"
         }
     }))
 }

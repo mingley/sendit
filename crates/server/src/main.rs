@@ -1,3 +1,4 @@
+mod bots;
 mod config;
 mod console;
 mod discovery;
@@ -49,12 +50,15 @@ fn run() -> Result<(), String> {
     let mut host = Host::bind(config)?;
     let addr = host.address().map_err(|e| e.to_string())?;
     println!(
-        "SENDIT_READY addr={addr} hz=128 snapshot_hz=32 map={} mode={:?} cap={}",
-        host.config.map, host.config.mode, host.config.capacity
+        "SENDIT_READY addr={addr} hz=128 snapshot_hz=32 map={} mode={:?} cap={} bots={}",
+        host.config.map,
+        host.config.mode,
+        host.config.capacity,
+        host.bot_count()
     );
     io::stdout().flush().map_err(|e| e.to_string())?;
     let console = console::read_commands();
-    let mut stats = Window::new(host.connected(), 0);
+    let mut stats = Window::new(host.connected(), host.bot_count());
     let mut next = Instant::now();
     let mut ticks = 0u64;
     'running: while !stopping() && host.config.ticks.is_none_or(|limit| ticks < limit) {
@@ -87,13 +91,13 @@ fn run() -> Result<(), String> {
             late,
             skipped,
             host.connected(),
-            0,
+            host.bot_count(),
             host.world.round_view().phase,
         );
         if host.config.report_ticks > 0 && ticks % host.config.report_ticks == 0 {
             stats.report(ticks, &host.traffic);
             host.traffic = Default::default();
-            stats = Window::new(host.connected(), 0);
+            stats = Window::new(host.connected(), host.bot_count());
         }
     }
     stats.report(ticks, &host.traffic);

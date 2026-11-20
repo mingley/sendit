@@ -145,9 +145,10 @@ impl Window {
         let rate = |bytes: u64| {
             (self.human_seconds > 0.0).then(|| bytes as f64 / self.human_seconds / 1024.0)
         };
+        let bots = self.players - self.humans;
         let [warmup, buy, live, planted, ended] = self.phase_ticks;
         println!(
-            "stats tick={tick} ticks={} players={} players_min={} players_max={} humans={} human_seconds={:.3} player_seconds={:.3} tick_p50_us={:.1} tick_p95_us={:.1} tick_p99_us={:.1} tick_max_us={:.1} missed_ticks={} skipped_slots={} cpu_pct={} rss_kib={} rx_bytes={} tx_bytes={} rx_kib_s_per_human={} tx_kib_s_per_human={} send_drops={} warmup_ticks={warmup} buy_ticks={buy} live_ticks={live} planted_ticks={planted} ended_ticks={ended}",
+            "stats tick={tick} ticks={} players={} players_min={} players_max={} humans={} bots={bots} human_seconds={:.3} player_seconds={:.3} tick_p50_us={:.1} tick_p95_us={:.1} tick_p99_us={:.1} tick_max_us={:.1} missed_ticks={} skipped_slots={} cpu_pct={} rss_kib={} rx_bytes={} tx_bytes={} rx_kib_s_per_human={} tx_kib_s_per_human={} send_drops={} warmup_ticks={warmup} buy_ticks={buy} live_ticks={live} planted_ticks={planted} ended_ticks={ended}",
             self.samples, self.players, self.players_min, self.players_max, self.humans, self.human_seconds, self.player_seconds, self.percentile_us(50), self.percentile_us(95), self.percentile_us(99),
             self.maximum_us, self.late + self.skipped, self.skipped, field(cpu),
             rss_kib().map(|rss| rss.to_string()).unwrap_or_else(|| "n/a".into()),

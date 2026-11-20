@@ -14,10 +14,15 @@ Hosting options
   --public-list IP:PORT  Announce this game to the specified community directory
   --rotation A,B,C     Ordered map identifiers; starts with the first unless --map is set
   --rotate-seconds N   Seconds per map (default 900; 0 enables manual rotation only)
-  --map NAME           Arena identifier (competitive default relay, otherwise drill)
+  --map NAME           Arena identifier (competitive: relay, surf: surf, otherwise drill)
   --mode MODE          practice, competitive, deathmatch, or surf (default practice)
   --loadout KIT        Deathmatch spawn kit: standard, light, or armored
-  --max-players N      Maximum connected players (default 10)
+  --max-players N      Maximum humans and bots combined (default 10)
+  --bots N             Reserve N slots for server bots (default 0)
+  --fill N             Fill open slots up to N occupants, yielding to arriving humans
+  --bot-skill F        Bot difficulty from 0.0 to 1.0 (default 0.65)
+  --bot-team TEAM      auto, t, or ct (default auto)
+  --bot-seed N         Deterministic bot workload seed (default 6619)
   --password-env VAR   Read the join password from this environment variable
   --friction F         Override ground friction for tuning or replay
   --record FILE        Record accepted user inputs as a replay trace
@@ -38,6 +43,11 @@ pub struct Config {
     pub mode: Mode,
     pub dm_loadout: Loadout,
     pub capacity: u16,
+    pub bots: u16,
+    pub fill: u16,
+    pub bot_skill: f32,
+    pub bot_team: Option<u8>,
+    pub bot_seed: u32,
     pub password: String,
     pub tuning: Tuning,
     pub record: Option<PathBuf>,
@@ -58,6 +68,11 @@ impl Config {
             mode: Mode::Practice,
             dm_loadout: Loadout::Standard,
             capacity: 10,
+            bots: 0,
+            fill: 0,
+            bot_skill: 0.65,
+            bot_team: None,
+            bot_seed: sendit_sim::bots::DEFAULT_BOT_SEED,
             password: String::new(),
             tuning: Tuning::default(),
             record: None,
@@ -110,6 +125,23 @@ impl Config {
                         _ => return Err(format!("unknown deathmatch spawn kit {value}")),
                     };
                 }
+                "--bots" => config.bots = value.parse().map_err(|_| "invalid fixed bot count")?,
+                "--fill" => config.fill = value.parse().map_err(|_| "invalid fill target")?,
+                "--bot-skill" => {
+                    config.bot_skill = value.parse().map_err(|_| "invalid bot skill")?;
+                    if !(0.0..=1.0).contains(&config.bot_skill) {
+                        return Err("--bot-skill must be a number between 0 and 1".into());
+                    }
+                }
+                "--bot-team" => {
+                    config.bot_team = match value.as_str() {
+                        "auto" => None,
+                        "t" => Some(0),
+                        "ct" => Some(1),
+                        _ => return Err("--bot-team must be auto, t or ct".into()),
+                    }
+                }
+                "--bot-seed" => config.bot_seed = value.parse().map_err(|_| "invalid bot seed")?,
                 "--max-players" => {
                     config.capacity = value.parse().map_err(|_| "invalid player cap")?;
                     if !(1..=32).contains(&config.capacity) {
@@ -138,7 +170,15 @@ impl Config {
                 _ => return Err(format!("unknown option {flag}")),
             }
         }
+        if config.bots.max(config.fill) > config.capacity {
+            return Err("--bots and --fill must fit within --max-players".into());
+        }
         if config.mode == Mode::Competitive {
+            if config.bots > 5 && config.bot_team.is_some() {
+                return Err(
+                    "at most five fixed competitive bots can be assigned to the same team".into(),
+                );
+            }
             if config.capacity > 10 {
                 return Err("competitive servers support up to five players per team".into());
             }
@@ -147,6 +187,9 @@ impl Config {
             }
         }
         if !explicit_map {
+            if config.mode == Mode::Surf {
+                config.map = "surf".into();
+            }
             if let Some(first) = config.rotation.first() {
                 config.map = first.clone();
             }
@@ -186,5 +229,17 @@ mod tests {
                 .dm_loadout,
             Loadout::Armored
         ));
+    }
+
+    #[test]
+    fn fixed_bots_must_fit_and_skills_are_finite() {
+        let parse = |args: &[&str]| Config::parse(args.iter().map(|arg| arg.to_string()));
+        assert!(parse(&["--mode", "competitive", "--bots", "6", "--bot-team", "ct"]).is_err());
+        assert!(parse(&["--max-players", "3", "--bots", "4"]).is_err());
+        assert!(parse(&["--max-players", "3", "--fill", "4"]).is_err());
+        assert!(parse(&["--bot-skill", "NaN"]).is_err());
+        assert!(parse(&["--bot-skill", "1.5"]).is_err());
+        assert!(parse(&["--mode", "competitive", "--bots", "5", "--bot-team", "t"]).is_ok());
+        assert_eq!(parse(&["--mode", "surf"]).unwrap().map, "surf");
     }
 }
